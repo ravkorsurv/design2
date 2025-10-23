@@ -11,15 +11,17 @@ from .utils import parse_date
 
 
 _ALERT_PATTERN = re.compile(
-    r"(?:^|,)\s*(?P<model>[^(),]+?)\s*\((?P<value>[-+]?[0-9]*\.?[0-9]+)\)\s*"
+    r"(?:^|,)\s*(?P<model>[^(),]+?)\s*\((?P<value>[^()]+)\)\s*"
 )
 
 
 def _parse_alert_impacts(cell: str) -> Iterator[Dict[str, str]]:
     for match in _ALERT_PATTERN.finditer(cell or ""):
+        raw_value = match.group("value").strip()
+        normalized = raw_value.replace(",", "").replace("%", "").replace(" ", "")
         yield {
             "model": match.group("model").strip(),
-            "value": match.group("value"),
+            "value": normalized,
         }
 
 def read_incidents(csv_path: Path) -> List[IncidentInput]:
@@ -90,12 +92,20 @@ def read_history(csv_path: Path) -> List[HistoryRow]:
                 period_end = parse_date(row["Period_End"])
             except ValueError as exc:
                 raise ValueError(f"Row {idx}: invalid period dates") from exc
+            if period_start > period_end:
+                raise ValueError(
+                    f"Row {idx}: Period_Start {period_start.isoformat()} after Period_End {period_end.isoformat()}"
+                )
             try:
                 records_observed = int(row["Records_Observed"] or 0)
                 alerts_investigated = int(row["Alerts_Investigated"] or 0)
                 stors_filed = int(row["Stors_Filed"] or 0)
             except ValueError as exc:
                 raise ValueError(f"Row {idx}: invalid numeric history values") from exc
+            if alerts_investigated < stors_filed:
+                raise ValueError(
+                    f"Row {idx}: Alerts_Investigated {alerts_investigated} lower than Stors_Filed {stors_filed}"
+                )
             history.append(
                 HistoryRow(
                     model_scope=row["Model_Scope"].strip(),
