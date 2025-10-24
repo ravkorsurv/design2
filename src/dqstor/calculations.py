@@ -57,7 +57,9 @@ def beta_inverse(alpha: float, beta: float, quantile: float) -> float:
         import mpmath  # type: ignore
     except ModuleNotFoundError:
         return _beta_inverse_numeric(alpha, beta, quantile)
-    return float(mpmath.betaincinv(alpha, beta, 0, quantile))
+    if hasattr(mpmath, "betaincinv"):
+        return float(mpmath.betaincinv(alpha, beta, 0, quantile))
+    return _beta_inverse_numeric(alpha, beta, quantile)
 
 
 def _beta_inverse_numeric(alpha: float, beta: float, quantile: float) -> float:
