@@ -277,9 +277,7 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
     On Error GoTo 0
 
     Dim rx As Object
-    Set rx = CreateObject("VBScript.RegExp")
-    rx.Global = True
-    rx.Pattern = "([^\(]+?)\s*\(([^\)]+)\)"
+    Set rx = GetScenarioRegex()
 
     Dim matches As Object
     Set matches = rx.Execute(potentialText)
@@ -338,6 +336,19 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
     Next scenarioKey
 
     Set ParseScenarioMateriality = impacts
+End Function
+
+Private Function GetScenarioRegex() As Object
+    Static scenarioRegex As Object
+
+    If scenarioRegex Is Nothing Then
+        Set scenarioRegex = CreateObject("VBScript.RegExp")
+    End If
+
+    scenarioRegex.Global = True
+    scenarioRegex.Pattern = "([^\(]+?)\s*\(([^\)]+)\)"
+
+    Set GetScenarioRegex = scenarioRegex
 End Function
 
 Private Function BuildHistoryRollup() As Object
