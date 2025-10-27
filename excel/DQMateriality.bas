@@ -1,13 +1,14 @@
-Attribute VB_Name = "DQSTOR"
+Attribute VB_Name = "DQMateriality"
 Option Explicit
 
-' VBA translation of the dqstor Python pipeline.
-' The module assumes the workbook contains the following tables/named ranges:
+' VBA workflow for assessing surveillance data quality/materiality using the
+' incident feed provided by Compliance Surveillance.  The module assumes the
+' workbook contains the following tables/named ranges:
 '   - Sheet "Incidents" with tables:
-'       * IncidentsRaw: raw incident feed including Alert_Impacted text
+'       * IncidentsRaw: raw incident feed including the scenario/materiality text
 '       * IncidentsExpanded: destination table populated by ExpandIncidents
-'   - Sheet "History" with table HistoryRaw storing historical alert statistics
-'   - Sheet "Output" with table OutputResults for the computed metrics
+'   - Sheet "History" with table HistoryRaw storing historical surveillance metrics
+'   - Sheet "Output" with table OutputResults for the computed risk scores
 '   - Sheet "Audit" with table AuditLog to track each run
 '   - Sheet "Config" with helper tables:
 '       * SeverityThresholds (columns: MinPct, Severity, optional Description)
@@ -18,8 +19,8 @@ Option Explicit
 '       * Config_RunUser (current analyst/user string)
 '       * Config_WorkbookVersion (text identifier)
 '
-' The workbook only relies on Excel/VBA features (no external add-ins).  All calculations
-' are orchestrated via the RunDQSTOR macro below.
+' The workbook only relies on Excel/VBA features (no external add-ins).  All
+' calculations are orchestrated via the RunDQMateriality macro below.
 
 Private Const SHEET_INCIDENTS As String = "Incidents"
 Private Const SHEET_HISTORY As String = "History"
@@ -36,7 +37,7 @@ Private Const TABLE_SEVERITY As String = "SeverityThresholds"
 Private Const TABLE_LIKELIHOOD As String = "LikelihoodThresholds"
 Private Const TABLE_DQMATRIX As String = "DQMatrix"
 
-Public Sub RunDQSTOR()
+Public Sub RunDQMateriality()
     Dim runTimestamp As Date
     runTimestamp = Now
 
@@ -51,7 +52,7 @@ Public Sub RunDQSTOR()
     WriteOutput outputRows
     AppendAuditEntry outputRows, runTimestamp
 
-    MsgBox "DQ/STOR calculations complete", vbInformation
+    MsgBox "DQ/materiality calculations complete", vbInformation
 End Sub
 
 Public Sub ExpandIncidents()
@@ -80,35 +81,39 @@ Public Sub ExpandIncidents()
     Dim r As Long
     For r = 1 To UBound(data, 1)
         Dim incidentId As String
-        incidentId = NzString(data(r, headerMap("Incident_ID")))
+        incidentId = NzString(data(r, headerMap("Serial Number")))
 
         Dim incidentDate As Date
-        incidentDate = NzDate(data(r, headerMap("Incident_Date")))
+        incidentDate = NzDate(data(r, headerMap("Date")))
 
-        Dim modelScope As String
-        modelScope = NzString(data(r, headerMap("Model_Scope")))
+        Dim sourceSystem As String
+        sourceSystem = NzString(data(r, headerMap("Source System")))
 
-        Dim recordsImpacted As Double
-        recordsImpacted = NzDouble(data(r, headerMap("Records_Impacted")))
+        Dim failedRecords As Double
+        failedRecords = NzDouble(data(r, headerMap("Count of Failed Records")))
 
-        Dim volumePct As Double
-        volumePct = NzDouble(data(r, headerMap("Pct_Volume_Impacted")))
+        Dim percentImpacted As Double
+        percentImpacted = NzDouble(data(r, headerMap("% of Records Impacted")))
 
-        Dim alertText As String
-        alertText = NzString(data(r, headerMap("Alert_Impacted")))
+        Dim scenariosText As String
+        scenariosText = NzString(data(r, headerMap("Scenarios Impacted")))
 
-        Dim impacts As Collection
-        Set impacts = ParseAlertImpacts(alertText, modelScope)
+        Dim potentialText As String
+        potentialText = NzString(data(r, headerMap("Potential missing alerts per scenario")))
+
+        Dim scenarioImpacts As Collection
+        Set scenarioImpacts = ParseScenarioMateriality(scenariosText, potentialText, sourceSystem)
 
         Dim impactItem As Variant
-        For Each impactItem In impacts
-            Dim rowValues(1 To 6) As Variant
+        For Each impactItem In scenarioImpacts
+            Dim rowValues(1 To 7) As Variant
             rowValues(1) = incidentId
-            rowValues(2) = impactItem("Model_Scope")
+            rowValues(2) = sourceSystem
             rowValues(3) = incidentDate
-            rowValues(4) = recordsImpacted
-            rowValues(5) = volumePct
-            rowValues(6) = impactItem("Alert_Impact")
+            rowValues(4) = failedRecords
+            rowValues(5) = percentImpacted
+            rowValues(6) = impactItem("Scenario")
+            rowValues(7) = impactItem("MissingAlerts")
             outRows.Add rowValues
         Next impactItem
     Next r
@@ -116,13 +121,13 @@ Public Sub ExpandIncidents()
     If outRows.Count = 0 Then Exit Sub
 
     Dim outputData() As Variant
-    ReDim outputData(1 To outRows.Count, 1 To 6)
+    ReDim outputData(1 To outRows.Count, 1 To 7)
 
     Dim i As Long, c As Long
     For i = 1 To outRows.Count
         Dim values() As Variant
         values = outRows(i)
-        For c = 1 To 6
+        For c = 1 To 7
             outputData(i, c) = values(c)
         Next c
     Next i
@@ -131,47 +136,85 @@ Public Sub ExpandIncidents()
     dstTable.DataBodyRange.Value = outputData
 End Sub
 
-Private Function ParseAlertImpacts(ByVal alertText As String, ByVal fallbackScope As String) As Collection
+Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
+                                          ByVal potentialText As String, _
+                                          ByVal fallbackScenario As String) As Collection
     Dim impacts As New Collection
+
+    Dim scenarioSet As Object
+    Set scenarioSet = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    scenarioSet.CompareMode = vbTextCompare
+    On Error GoTo 0
+
+    Dim potentialDict As Object
+    Set potentialDict = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    potentialDict.CompareMode = vbTextCompare
+    On Error GoTo 0
 
     Dim rx As Object
     Set rx = CreateObject("VBScript.RegExp")
     rx.Global = True
-    rx.Pattern = "([^;]+?)\s*\(([^\)]+)\)"
+    rx.Pattern = "([^\(]+?)\s*\(([^\)]+)\)"
 
     Dim matches As Object
-    Set matches = rx.Execute(alertText)
+    Set matches = rx.Execute(potentialText)
 
     Dim i As Long
-    If matches.Count = 0 Then
-        Dim singleImpact As Object
-        Set singleImpact = CreateObject("Scripting.Dictionary")
-        singleImpact.Add "Model_Scope", fallbackScope
-        singleImpact.Add "Alert_Impact", NzDouble(alertText)
-        impacts.Add singleImpact
-        Set ParseAlertImpacts = impacts
-        Exit Function
-    End If
-
     For i = 0 To matches.Count - 1
         Dim match As Object
         Set match = matches(i)
 
-        Dim scope As String
-        scope = Trim(match.SubMatches(0))
-        If scope = "" Then scope = fallbackScope
+        Dim scenarioName As String
+        scenarioName = NormalizeScenarioName(match.SubMatches(0))
 
-        Dim impactValue As Double
-        impactValue = NzDouble(match.SubMatches(1))
+        Dim materialityValue As Double
+        materialityValue = NzDouble(match.SubMatches(1))
 
-        Dim entry As Object
-        Set entry = CreateObject("Scripting.Dictionary")
-        entry.Add "Model_Scope", scope
-        entry.Add "Alert_Impact", impactValue
-        impacts.Add entry
+        If potentialDict.Exists(scenarioName) Then
+            potentialDict(scenarioName) = potentialDict(scenarioName) + materialityValue
+        Else
+            potentialDict.Add scenarioName, materialityValue
+        End If
+
+        scenarioSet(scenarioName) = True
     Next i
 
-    Set ParseAlertImpacts = impacts
+    Dim rawScenarios As Variant
+    rawScenarios = SplitScenarios(scenariosText)
+
+    If Not IsEmpty(rawScenarios) Then
+        For i = LBound(rawScenarios) To UBound(rawScenarios)
+            Dim candidate As String
+            candidate = NormalizeScenarioName(rawScenarios(i))
+            If candidate <> "" Then
+                scenarioSet(candidate) = True
+            End If
+        Next i
+    End If
+
+    If scenarioSet.Count = 0 Then
+        Dim defaultScenario As String
+        defaultScenario = NormalizeScenarioName(fallbackScenario)
+        If defaultScenario = "" Then defaultScenario = "Unspecified"
+        scenarioSet(defaultScenario) = True
+    End If
+
+    Dim scenarioKey As Variant
+    For Each scenarioKey In scenarioSet.Keys
+        Dim entry As Object
+        Set entry = CreateObject("Scripting.Dictionary")
+        entry.Add "Scenario", scenarioKey
+        If potentialDict.Exists(scenarioKey) Then
+            entry.Add "MissingAlerts", potentialDict(scenarioKey)
+        Else
+            entry.Add "MissingAlerts", 0#
+        End If
+        impacts.Add entry
+    Next scenarioKey
+
+    Set ParseScenarioMateriality = impacts
 End Function
 
 Private Function BuildHistoryRollup() As Object
@@ -183,6 +226,9 @@ Private Function BuildHistoryRollup() As Object
 
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
+    On Error Resume Next
+    dict.CompareMode = vbTextCompare
+    On Error GoTo 0
 
     If tbl.ListRows.Count = 0 Then
         Set BuildHistoryRollup = dict
@@ -207,8 +253,14 @@ Private Function BuildHistoryRollup() As Object
         periodEnd = NzDate(data(r, headerMap("Period_End")))
         If periodEnd < windowStart Then GoTo ContinueRow
 
+        Dim sourceSystem As String
+        sourceSystem = NzString(data(r, headerMap("Source_System")))
+
+        Dim scenarioName As String
+        scenarioName = NzString(data(r, headerMap("Scenario_Name")))
+
         Dim key As String
-        key = NzString(data(r, headerMap("Model_Scope")))
+        key = BuildHistoryKey(sourceSystem, scenarioName)
 
         Dim bucket As Variant
         If dict.Exists(key) Then
@@ -219,7 +271,7 @@ Private Function BuildHistoryRollup() As Object
 
         bucket(0) = bucket(0) + NzDouble(data(r, headerMap("Records_Observed")))
         bucket(1) = bucket(1) + NzDouble(data(r, headerMap("Alerts_Investigated")))
-        bucket(2) = bucket(2) + NzDouble(data(r, headerMap("STORs_Filed")))
+        bucket(2) = bucket(2) + NzDouble(data(r, headerMap("Materiality_Positive")))
 
         dict(key) = bucket
 ContinueRow:
@@ -243,7 +295,7 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
     End If
 
     Dim outputRows() As Variant
-    ReDim outputRows(1 To rowCount, 1 To 19)
+    ReDim outputRows(1 To rowCount, 1 To 22)
 
     Dim data As Variant
     data = tbl.DataBodyRange.Value
@@ -268,46 +320,52 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
 
     Dim rowIndex As Long
     For rowIndex = 1 To UBound(data, 1)
-        Dim modelScope As String
-        modelScope = NzString(data(rowIndex, headerMap("Model_Scope")))
+        Dim sourceSystem As String
+        sourceSystem = NzString(data(rowIndex, headerMap("Source_System")))
 
-        Dim recordsImpacted As Double
-        recordsImpacted = NzDouble(data(rowIndex, headerMap("Records_Impacted")))
+        Dim scenarioName As String
+        scenarioName = NzString(data(rowIndex, headerMap("Scenario_Name")))
 
-        Dim volumePct As Double
-        volumePct = NzDouble(data(rowIndex, headerMap("Pct_Volume_Impacted")))
+        Dim failedRecords As Double
+        failedRecords = NzDouble(data(rowIndex, headerMap("Failed_Records")))
 
-        Dim alertImpact As Double
-        alertImpact = NzDouble(data(rowIndex, headerMap("Alert_Impact")))
+        Dim percentImpacted As Double
+        percentImpacted = NzDouble(data(rowIndex, headerMap("Pct_Records_Impacted")))
+
+        Dim missingAlerts As Double
+        missingAlerts = NzDouble(data(rowIndex, headerMap("Missing_Alerts")))
 
         Dim incidentDate As Date
         incidentDate = NzDate(data(rowIndex, headerMap("Incident_Date")))
 
         Dim incidentId As String
-        incidentId = NzString(data(rowIndex, headerMap("Incident_ID")))
+        incidentId = NzString(data(rowIndex, headerMap("Serial_Number")))
+
+        Dim historyKey As String
+        historyKey = BuildHistoryKey(sourceSystem, scenarioName)
 
         Dim bucket As Variant
-        If rollup.Exists(modelScope) Then
-            bucket = rollup(modelScope)
+        If rollup.Exists(historyKey) Then
+            bucket = rollup(historyKey)
         Else
             bucket = CreateHistoryBucket()
         End If
 
-        Dim baselineRate As Double
+        Dim historyAlertRate As Double
         If bucket(0) = 0 Then
-            baselineRate = 0
+            historyAlertRate = 0
         Else
-            baselineRate = bucket(1) / bucket(0)
+            historyAlertRate = bucket(1) / bucket(0)
         End If
 
         Dim missedAlerts As Double
-        missedAlerts = recordsImpacted * baselineRate
+        missedAlerts = missingAlerts
 
         Dim likelihoodBand As String
-        likelihoodBand = DetermineLikelihood(alertImpact, likelihoodTable)
+        likelihoodBand = DetermineLikelihood(missedAlerts, likelihoodTable)
 
         Dim severity As String
-        severity = DetermineSeverity(volumePct, severityTable)
+        severity = DetermineSeverity(percentImpacted, severityTable)
 
         Dim dqFinal As String
         dqFinal = ResolveDQFinal(severity, likelihoodBand, dqMatrix)
@@ -318,24 +376,24 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
         Dim beta As Double
         beta = (bucket(1) - bucket(2)) + 0.5
 
-        Dim storMean As Double
-        storMean = alpha / (alpha + beta)
+        Dim materialityMean As Double
+        materialityMean = alpha / (alpha + beta)
 
-        Dim stor95 As Double
-        stor95 = BetaInverse(alpha, beta, 0.95)
+        Dim materiality95 As Double
+        materiality95 = BetaInverse(alpha, beta, 0.95)
 
         Dim expectedMean As Double
-        expectedMean = missedAlerts * storMean
+        expectedMean = missedAlerts * materialityMean
 
         Dim expected95 As Double
-        expected95 = missedAlerts * stor95
+        expected95 = missedAlerts * materiality95
 
         Dim pAtLeastOne As Double
         pAtLeastOne = 1 - Exp(-expected95)
 
         Dim noteText As String
         If bucket(0) = 0 And bucket(1) = 0 Then
-            noteText = "No lookback history available"
+            noteText = "No lookback history available for " & sourceSystem & " / " & scenarioName
         Else
             noteText = ""
         End If
@@ -344,18 +402,20 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
         outCol = 1
 
         outputRows(rowIndex, outCol) = incidentId: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = modelScope: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = sourceSystem: outCol = outCol + 1
         outputRows(rowIndex, outCol) = incidentDate: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = scenarioName: outCol = outCol + 1
         outputRows(rowIndex, outCol) = severity: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = recordsImpacted: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = baselineRate: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = failedRecords: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = percentImpacted: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = historyAlertRate: outCol = outCol + 1
         outputRows(rowIndex, outCol) = missedAlerts: outCol = outCol + 1
         outputRows(rowIndex, outCol) = likelihoodBand: outCol = outCol + 1
         outputRows(rowIndex, outCol) = dqFinal: outCol = outCol + 1
         outputRows(rowIndex, outCol) = alpha: outCol = outCol + 1
         outputRows(rowIndex, outCol) = beta: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = storMean: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = stor95: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = materialityMean: outCol = outCol + 1
+        outputRows(rowIndex, outCol) = materiality95: outCol = outCol + 1
         outputRows(rowIndex, outCol) = expectedMean: outCol = outCol + 1
         outputRows(rowIndex, outCol) = expected95: outCol = outCol + 1
         outputRows(rowIndex, outCol) = pAtLeastOne: outCol = outCol + 1
@@ -634,6 +694,10 @@ Private Function LoadDQMatrix() As Object
     Set LoadDQMatrix = dict
 End Function
 
+Private Function BuildHistoryKey(ByVal sourceSystem As String, ByVal scenarioName As String) As String
+    BuildHistoryKey = NormalizeScenarioName(sourceSystem) & "|" & NormalizeScenarioName(scenarioName)
+End Function
+
 Private Function GetNamedRange(ByVal name As String) As Variant
     GetNamedRange = ThisWorkbook.Names(name).RefersToRange.Value
 End Function
@@ -644,6 +708,40 @@ Private Function CreateHistoryBucket() As Variant
     bucket(1) = 0
     bucket(2) = 0
     CreateHistoryBucket = bucket
+End Function
+
+Private Function SplitScenarios(ByVal value As String) As Variant
+    Dim trimmed As String
+    trimmed = Trim$(value)
+
+    If trimmed = "" Then
+        SplitScenarios = Empty
+        Exit Function
+    End If
+
+    Dim parts() As String
+    parts = Split(trimmed, ",")
+
+    Dim i As Long
+    For i = LBound(parts) To UBound(parts)
+        parts(i) = NormalizeScenarioName(parts(i))
+    Next i
+
+    SplitScenarios = parts
+End Function
+
+Private Function NormalizeScenarioName(ByVal value As String) As String
+    Dim text As String
+    text = CStr(value)
+    text = Replace(text, vbCrLf, " ")
+    text = Replace(text, vbTab, " ")
+    text = Trim$(text)
+
+    Do While InStr(text, "  ") > 0
+        text = Replace(text, "  ", " ")
+    Loop
+
+    NormalizeScenarioName = text
 End Function
 
 Private Sub ClearTable(ByVal table As ListObject)
