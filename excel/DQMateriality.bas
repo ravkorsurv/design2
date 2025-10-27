@@ -1278,6 +1278,12 @@ Private Function DetermineSeverity(ByVal pct As Double, ByVal tableData As Varia
     Dim result As String
     result = "Medium"
 
+    If ArrayRowCount(tableData) = 0 Then
+        NotifyMissingConfig TABLE_SEVERITY
+        DetermineSeverity = result
+        Exit Function
+    End If
+
     Dim i As Long
     For i = LBound(tableData, 1) To UBound(tableData, 1)
         Dim threshold As Double
@@ -1294,6 +1300,12 @@ Private Function DetermineLikelihood(ByVal alertImpact As Double, ByVal tableDat
     Dim result As String
     result = "Low"
 
+    If ArrayRowCount(tableData) = 0 Then
+        NotifyMissingConfig TABLE_LIKELIHOOD
+        DetermineLikelihood = result
+        Exit Function
+    End If
+
     Dim i As Long
     For i = LBound(tableData, 1) To UBound(tableData, 1)
         Dim threshold As Double
@@ -1304,6 +1316,24 @@ Private Function DetermineLikelihood(ByVal alertImpact As Double, ByVal tableDat
     Next i
 
     DetermineLikelihood = result
+End Function
+
+Private Sub NotifyMissingConfig(ByVal tableName As String)
+    Dim tracker As Object
+    Set tracker = MissingConfigAlertTracker()
+
+    If tracker.Exists(tableName) Then Exit Sub
+
+    tracker(tableName) = True
+    MsgBox "Configuration table '" & tableName & "' has no rows. Default thresholds will be used.", vbExclamation
+End Sub
+
+Private Function MissingConfigAlertTracker() As Object
+    Static tracker As Object
+    If tracker Is Nothing Then
+        Set tracker = CreateObject("Scripting.Dictionary")
+    End If
+    Set MissingConfigAlertTracker = tracker
 End Function
 
 Private Function ResolveDQFinal(ByVal severity As String, ByVal likelihood As String, ByVal dqMatrix As Object) As String
@@ -1389,8 +1419,7 @@ Private Function LoadTableData(ByVal sheetName As String, ByVal tableName As Str
     Set tbl = ThisWorkbook.Worksheets(sheetName).ListObjects(tableName)
 
     If tbl.ListRows.Count = 0 Then
-        Dim emptyData(1 To 1, 1 To tbl.ListColumns.Count) As Variant
-        LoadTableData = emptyData
+        LoadTableData = VBA.Array()
     Else
         LoadTableData = tbl.DataBodyRange.Value
     End If
