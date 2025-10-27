@@ -38,6 +38,36 @@ Private Const TABLE_SEVERITY As String = "SeverityThresholds"
 Private Const TABLE_LIKELIHOOD As String = "LikelihoodThresholds"
 Private Const TABLE_DQMATRIX As String = "DQMatrix"
 Private Const TABLE_SCENARIO_FAMILY As String = "ScenarioModelFamilies"
+
+Private Type IncidentColumnIndexes
+    SourceSystem As Long
+    AssetClass As Long
+    ScenarioName As Long
+    ModelFamily As Long
+    FailedRecords As Long
+    PercentImpacted As Long
+    MissingAlerts As Long
+    IncidentDate As Long
+    SerialNumber As Long
+End Type
+
+Private Function BuildIncidentColumnIndexes(ByVal headerMap As Object) As IncidentColumnIndexes
+    Dim indexes As IncidentColumnIndexes
+
+    With indexes
+        .SourceSystem = headerMap("Source_System")
+        .AssetClass = headerMap("Asset_Class")
+        .ScenarioName = headerMap("Scenario_Name")
+        .ModelFamily = headerMap("Model_Family")
+        .FailedRecords = headerMap("Failed_Records")
+        .PercentImpacted = headerMap("Pct_Records_Impacted")
+        .MissingAlerts = headerMap("Missing_Alerts")
+        .IncidentDate = headerMap("Incident_Date")
+        .SerialNumber = headerMap("Serial_Number")
+    End With
+
+    BuildIncidentColumnIndexes = indexes
+End Function
 Private Const TABLE_MATERIAL_CATEGORIES As String = "MaterialCategories"
 Private Const TABLE_MATERIAL_OUTPUTS As String = "MaterialOutputsRaw"
 Private Const TABLE_STS_ALERTS As String = "STSAlertsRaw"
@@ -373,6 +403,120 @@ ContinueRow:
     Set BuildHistoryRollup = dict
 End Function
 
+Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, ByVal indexes As IncidentColumnIndexes, ByVal rollup As Object, ByVal severityTable As Variant, ByVal likelihoodTable As Variant, ByVal dqMatrix As Object, ByVal runTimestamp As Date, ByVal runUser As String, ByVal workbookVersion As String) As Variant
+    Dim sourceSystem As String
+    sourceSystem = NzString(data(rowIndex, indexes.SourceSystem))
+
+    Dim assetClass As String
+    assetClass = NzString(data(rowIndex, indexes.AssetClass))
+
+    Dim scenarioName As String
+    scenarioName = NzString(data(rowIndex, indexes.ScenarioName))
+
+    Dim modelFamily As String
+    modelFamily = NzString(data(rowIndex, indexes.ModelFamily))
+
+    Dim failedRecords As Double
+    failedRecords = NzDouble(data(rowIndex, indexes.FailedRecords))
+
+    Dim percentImpacted As Double
+    percentImpacted = NzDouble(data(rowIndex, indexes.PercentImpacted))
+
+    Dim missingAlerts As Double
+    missingAlerts = NzDouble(data(rowIndex, indexes.MissingAlerts))
+
+    Dim incidentDate As Date
+    incidentDate = NzDate(data(rowIndex, indexes.IncidentDate))
+
+    Dim incidentId As String
+    incidentId = NzString(data(rowIndex, indexes.SerialNumber))
+
+    Dim historyKey As String
+    historyKey = BuildHistoryKey(sourceSystem, scenarioName)
+
+    Dim bucket As Variant
+    If rollup.Exists(historyKey) Then
+        bucket = rollup(historyKey)
+    Else
+        bucket = CreateHistoryBucket()
+    End If
+
+    Dim historyAlertRate As Double
+    If bucket(0) = 0 Then
+        historyAlertRate = 0
+    Else
+        historyAlertRate = bucket(1) / bucket(0)
+    End If
+
+    Dim missedAlerts As Double
+    missedAlerts = missingAlerts
+
+    Dim likelihoodBand As String
+    likelihoodBand = DetermineLikelihood(missedAlerts, likelihoodTable)
+
+    Dim severity As String
+    severity = DetermineSeverity(percentImpacted, severityTable)
+
+    Dim dqFinal As String
+    dqFinal = ResolveDQFinal(severity, likelihoodBand, dqMatrix)
+
+    Dim alpha As Double
+    alpha = bucket(2) + 0.5
+
+    Dim beta As Double
+    beta = (bucket(1) - bucket(2)) + 0.5
+
+    Dim materialityMean As Double
+    materialityMean = alpha / (alpha + beta)
+
+    Dim materiality95 As Double
+    materiality95 = BetaInverse(alpha, beta, 0.95)
+
+    Dim expectedMean As Double
+    expectedMean = missedAlerts * materialityMean
+
+    Dim expected95 As Double
+    expected95 = missedAlerts * materiality95
+
+    Dim pAtLeastOne As Double
+    pAtLeastOne = 1 - Exp(-expected95)
+
+    Dim noteText As String
+    If bucket(0) = 0 And bucket(1) = 0 Then
+        noteText = "No lookback history available for " & sourceSystem & " / " & scenarioName
+    Else
+        noteText = ""
+    End If
+
+    Dim result(1 To 24) As Variant
+    result(1) = incidentId
+    result(2) = sourceSystem
+    result(3) = assetClass
+    result(4) = incidentDate
+    result(5) = scenarioName
+    result(6) = modelFamily
+    result(7) = severity
+    result(8) = failedRecords
+    result(9) = percentImpacted
+    result(10) = historyAlertRate
+    result(11) = missedAlerts
+    result(12) = likelihoodBand
+    result(13) = dqFinal
+    result(14) = alpha
+    result(15) = beta
+    result(16) = materialityMean
+    result(17) = materiality95
+    result(18) = expectedMean
+    result(19) = expected95
+    result(20) = pAtLeastOne
+    result(21) = runTimestamp
+    result(22) = runUser
+    result(23) = workbookVersion
+    result(24) = noteText
+
+    BuildOutputRow = result
+End Function
+
 Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As Date) As Variant
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -396,6 +540,9 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
     Dim headerMap As Object
     Set headerMap = BuildHeaderIndex(tbl)
 
+    Dim indexes As IncidentColumnIndexes
+    indexes = BuildIncidentColumnIndexes(headerMap)
+
     Dim severityTable As Variant
     severityTable = LoadTableData(SHEET_CONFIG, TABLE_SEVERITY)
 
@@ -413,117 +560,13 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
 
     Dim rowIndex As Long
     For rowIndex = 1 To UBound(data, 1)
-        Dim sourceSystem As String
-        sourceSystem = NzString(data(rowIndex, headerMap("Source_System")))
-
-        Dim assetClass As String
-        assetClass = NzString(data(rowIndex, headerMap("Asset_Class")))
-
-        Dim scenarioName As String
-        scenarioName = NzString(data(rowIndex, headerMap("Scenario_Name")))
-
-        Dim modelFamily As String
-        modelFamily = NzString(data(rowIndex, headerMap("Model_Family")))
-
-        Dim failedRecords As Double
-        failedRecords = NzDouble(data(rowIndex, headerMap("Failed_Records")))
-
-        Dim percentImpacted As Double
-        percentImpacted = NzDouble(data(rowIndex, headerMap("Pct_Records_Impacted")))
-
-        Dim missingAlerts As Double
-        missingAlerts = NzDouble(data(rowIndex, headerMap("Missing_Alerts")))
-
-        Dim incidentDate As Date
-        incidentDate = NzDate(data(rowIndex, headerMap("Incident_Date")))
-
-        Dim incidentId As String
-        incidentId = NzString(data(rowIndex, headerMap("Serial_Number")))
-
-        Dim historyKey As String
-        historyKey = BuildHistoryKey(sourceSystem, scenarioName)
-
-        Dim bucket As Variant
-        If rollup.Exists(historyKey) Then
-            bucket = rollup(historyKey)
-        Else
-            bucket = CreateHistoryBucket()
-        End If
-
-        Dim historyAlertRate As Double
-        If bucket(0) = 0 Then
-            historyAlertRate = 0
-        Else
-            historyAlertRate = bucket(1) / bucket(0)
-        End If
-
-        Dim missedAlerts As Double
-        missedAlerts = missingAlerts
-
-        Dim likelihoodBand As String
-        likelihoodBand = DetermineLikelihood(missedAlerts, likelihoodTable)
-
-        Dim severity As String
-        severity = DetermineSeverity(percentImpacted, severityTable)
-
-        Dim dqFinal As String
-        dqFinal = ResolveDQFinal(severity, likelihoodBand, dqMatrix)
-
-        Dim alpha As Double
-        alpha = bucket(2) + 0.5
-
-        Dim beta As Double
-        beta = (bucket(1) - bucket(2)) + 0.5
-
-        Dim materialityMean As Double
-        materialityMean = alpha / (alpha + beta)
-
-        Dim materiality95 As Double
-        materiality95 = BetaInverse(alpha, beta, 0.95)
-
-        Dim expectedMean As Double
-        expectedMean = missedAlerts * materialityMean
-
-        Dim expected95 As Double
-        expected95 = missedAlerts * materiality95
-
-        Dim pAtLeastOne As Double
-        pAtLeastOne = 1 - Exp(-expected95)
-
-        Dim noteText As String
-        If bucket(0) = 0 And bucket(1) = 0 Then
-            noteText = "No lookback history available for " & sourceSystem & " / " & scenarioName
-        Else
-            noteText = ""
-        End If
+        Dim rowValues As Variant
+        rowValues = BuildOutputRow(rowIndex, data, indexes, rollup, severityTable, likelihoodTable, dqMatrix, runTimestamp, runUser, workbookVersion)
 
         Dim outCol As Long
-        outCol = 1
-
-        outputRows(rowIndex, outCol) = incidentId: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = sourceSystem: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = assetClass: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = incidentDate: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = scenarioName: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = modelFamily: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = severity: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = failedRecords: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = percentImpacted: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = historyAlertRate: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = missedAlerts: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = likelihoodBand: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = dqFinal: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = alpha: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = beta: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = materialityMean: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = materiality95: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = expectedMean: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = expected95: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = pAtLeastOne: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = runTimestamp: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = runUser: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = workbookVersion: outCol = outCol + 1
-        outputRows(rowIndex, outCol) = noteText
+        For outCol = 1 To 24
+            outputRows(rowIndex, outCol) = rowValues(outCol)
+        Next outCol
     Next rowIndex
 
     ComputeOutputRows = outputRows
