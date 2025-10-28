@@ -79,6 +79,8 @@ Public Sub RunDQMateriality()
 
     ExpandIncidents
 
+    WriteHistoryFromIncidents
+
     Dim rollup As Object
     Set rollup = BuildHistoryRollup
 
@@ -356,7 +358,7 @@ Private Function BuildHistoryRollup() As Object
     Set wb = ThisWorkbook
 
     Dim tbl As ListObject
-    Set tbl = wb.Worksheets(SHEET_HISTORY).ListObjects(TABLE_HISTORY_RAW)
+    Set tbl = wb.Worksheets(SHEET_INCIDENTS).ListObjects(TABLE_INCIDENTS_EXPANDED)
 
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
@@ -375,6 +377,9 @@ Private Function BuildHistoryRollup() As Object
     Dim headerMap As Object
     Set headerMap = BuildHeaderIndex(tbl)
 
+    Dim indexes As IncidentColumnIndexes
+    indexes = BuildIncidentColumnIndexes(headerMap)
+
     Dim lookbackDays As Long
     lookbackDays = CLng(GetNamedRange("Config_LookbackDays"))
 
@@ -383,31 +388,53 @@ Private Function BuildHistoryRollup() As Object
 
     Dim r As Long
     For r = 1 To UBound(data, 1)
-        Dim periodEnd As Date
-        periodEnd = NzDate(data(r, headerMap("Period_End")))
-        If periodEnd < windowStart Then GoTo ContinueRow
+        Dim incidentDate As Date
+        incidentDate = NzDate(data(r, indexes.IncidentDate))
+        If incidentDate < windowStart Then GoTo ContinueRow
 
         Dim sourceSystem As String
-        sourceSystem = NzString(data(r, headerMap("Source_System")))
+        sourceSystem = NzString(data(r, indexes.SourceSystem))
 
         Dim scenarioName As String
-        scenarioName = NzString(data(r, headerMap("Scenario_Name")))
+        scenarioName = NzString(data(r, indexes.ScenarioName))
+
+        Dim modelFamily As String
+        modelFamily = NzString(data(r, indexes.ModelFamily))
 
         Dim key As String
-        key = BuildHistoryKey(sourceSystem, scenarioName)
+        key = BuildHistoryKey(sourceSystem, scenarioName, modelFamily)
 
-        Dim bucket As Variant
+        Dim bucket As Object
         If dict.Exists(key) Then
-            bucket = dict(key)
+            Set bucket = dict(key)
         Else
-            bucket = CreateHistoryBucket()
+            Set bucket = CreateHistoryBucket()
         End If
 
-        bucket(0) = bucket(0) + NzDouble(data(r, headerMap("Records_Observed")))
-        bucket(1) = bucket(1) + NzDouble(data(r, headerMap("Alerts_Investigated")))
-        bucket(2) = bucket(2) + NzDouble(data(r, headerMap("Materiality_Positive")))
+        Dim failedRecords As Double
+        failedRecords = NzDouble(data(r, indexes.FailedRecords))
+        bucket("TotalFailedRecords") = bucket("TotalFailedRecords") + failedRecords
 
-        dict(key) = bucket
+        Dim missingAlerts As Double
+        missingAlerts = NzDouble(data(r, indexes.MissingAlerts))
+        bucket("TotalMissingAlerts") = bucket("TotalMissingAlerts") + missingAlerts
+
+        bucket("IncidentCount") = bucket("IncidentCount") + 1
+
+        Dim percentImpacted As Double
+        percentImpacted = NzDouble(data(r, indexes.PercentImpacted))
+        If missingAlerts > 0# Or percentImpacted > 0# Then
+            bucket("PositiveIncidentCount") = bucket("PositiveIncidentCount") + 1
+        End If
+
+        If incidentDate >= bucket("MostRecentDate") Then
+            bucket("MostRecentDate") = incidentDate
+            bucket("MostRecentFailedRecords") = failedRecords
+            bucket("MostRecentPercentImpacted") = percentImpacted
+            bucket("MostRecentMissingAlerts") = missingAlerts
+        End If
+
+        Set dict(key) = bucket
 ContinueRow:
     Next r
 
@@ -443,20 +470,26 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     incidentId = NzString(data(rowIndex, indexes.SerialNumber))
 
     Dim historyKey As String
-    historyKey = BuildHistoryKey(sourceSystem, scenarioName)
+    historyKey = BuildHistoryKey(sourceSystem, scenarioName, modelFamily)
 
-    Dim bucket As Variant
+    Dim bucket As Object
     If rollup.Exists(historyKey) Then
-        bucket = rollup(historyKey)
+        Set bucket = rollup(historyKey)
     Else
-        bucket = CreateHistoryBucket()
+        Set bucket = CreateHistoryBucket()
     End If
 
+    Dim totalFailedHistory As Double
+    totalFailedHistory = bucket("TotalFailedRecords")
+
+    Dim totalMissingHistory As Double
+    totalMissingHistory = bucket("TotalMissingAlerts")
+
     Dim historyAlertRate As Double
-    If bucket(0) = 0 Then
+    If totalFailedHistory = 0 Then
         historyAlertRate = 0
     Else
-        historyAlertRate = bucket(1) / bucket(0)
+        historyAlertRate = totalMissingHistory / totalFailedHistory
     End If
 
     Dim missedAlerts As Double
@@ -472,10 +505,10 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     dqFinal = ResolveDQFinal(severity, likelihoodBand, dqMatrix)
 
     Dim alpha As Double
-    alpha = bucket(2) + 0.5
+    alpha = bucket("PositiveIncidentCount") + 0.5
 
     Dim beta As Double
-    beta = (bucket(1) - bucket(2)) + 0.5
+    beta = (bucket("IncidentCount") - bucket("PositiveIncidentCount")) + 0.5
 
     Dim materialityMean As Double
     materialityMean = alpha / (alpha + beta)
@@ -493,7 +526,7 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     pAtLeastOne = 1 - Exp(-expected95)
 
     Dim noteText As String
-    If bucket(0) = 0 And bucket(1) = 0 Then
+    If bucket("IncidentCount") = 0 Then
         noteText = "No lookback history available for " & sourceSystem & " / " & scenarioName
     Else
         noteText = ""
@@ -1236,6 +1269,91 @@ Private Sub WriteOutput(ByVal rows As Variant)
     tbl.DataBodyRange.Value = rows
 End Sub
 
+Private Sub WriteHistoryFromIncidents()
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+    Dim srcTable As ListObject
+    Set srcTable = wb.Worksheets(SHEET_INCIDENTS).ListObjects(TABLE_INCIDENTS_EXPANDED)
+
+    Dim historyTable As ListObject
+    Set historyTable = wb.Worksheets(SHEET_HISTORY).ListObjects(TABLE_HISTORY_RAW)
+
+    ClearTable historyTable
+    EnsureHistoryTableLayout historyTable
+
+    If srcTable.ListRows.Count = 0 Then
+        UpdateHistoryNamedRanges historyTable
+        Exit Sub
+    End If
+
+    Dim data As Variant
+    data = srcTable.DataBodyRange.Value
+
+    Dim headerMap As Object
+    Set headerMap = BuildHeaderIndex(srcTable)
+
+    Dim indexes As IncidentColumnIndexes
+    indexes = BuildIncidentColumnIndexes(headerMap)
+
+    Dim lookbackDays As Long
+    lookbackDays = CLng(GetNamedRange("Config_LookbackDays"))
+
+    Dim windowStart As Date
+    windowStart = Date - lookbackDays
+
+    Dim rows As Collection
+    Set rows = New Collection
+
+    Dim r As Long
+    For r = 1 To UBound(data, 1)
+        Dim incidentDate As Date
+        incidentDate = NzDate(data(r, indexes.IncidentDate))
+        If incidentDate < windowStart Then GoTo ContinueRow
+
+        Dim rowValues(1 To 9) As Variant
+        rowValues(1) = incidentDate
+        rowValues(2) = NzString(data(r, indexes.SourceSystem))
+        rowValues(3) = NzString(data(r, indexes.AssetClass))
+        rowValues(4) = NzString(data(r, indexes.ScenarioName))
+        rowValues(5) = NzString(data(r, indexes.ModelFamily))
+        rowValues(6) = NzDouble(data(r, indexes.FailedRecords))
+        rowValues(7) = NzDouble(data(r, indexes.PercentImpacted))
+        rowValues(8) = NzDouble(data(r, indexes.MissingAlerts))
+        rowValues(9) = NzString(data(r, indexes.SerialNumber))
+        rows.Add rowValues
+ContinueRow:
+    Next r
+
+    If rows.Count = 0 Then
+        UpdateHistoryNamedRanges historyTable
+        Exit Sub
+    End If
+
+    Dim rowCount As Long
+    rowCount = rows.Count
+
+    Dim outputData() As Variant
+    ReDim outputData(1 To rowCount, 1 To 9)
+
+    Dim i As Long, c As Long
+    For i = 1 To rowCount
+        Dim values() As Variant
+        values = rows(i)
+        For c = 1 To 9
+            outputData(i, c) = values(c)
+        Next c
+    Next i
+
+    Dim headers As Variant
+    headers = HistoryTableHeaders()
+
+    historyTable.Resize historyTable.Range.Resize(RowSize:=rowCount + 1, ColumnSize:=UBound(headers) - LBound(headers) + 1)
+    historyTable.DataBodyRange.Value = outputData
+
+    UpdateHistoryNamedRanges historyTable
+End Sub
+
 Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date)
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -1514,21 +1632,90 @@ Private Function LoadDQMatrix() As Object
     Set LoadDQMatrix = dict
 End Function
 
-Private Function BuildHistoryKey(ByVal sourceSystem As String, ByVal scenarioName As String) As String
-    BuildHistoryKey = NormalizeScenarioName(sourceSystem) & "|" & NormalizeScenarioName(scenarioName)
+Private Function BuildHistoryKey(ByVal sourceSystem As String, ByVal scenarioName As String, Optional ByVal modelFamily As String = "") As String
+    Dim key As String
+    key = NormalizeScenarioName(sourceSystem) & "|" & NormalizeScenarioName(scenarioName)
+    If Len(modelFamily) > 0 Then
+        key = key & "|" & NormalizeScenarioName(modelFamily)
+    End If
+    BuildHistoryKey = key
 End Function
 
 Private Function GetNamedRange(ByVal name As String) As Variant
     GetNamedRange = ThisWorkbook.Names(name).RefersToRange.Value
 End Function
 
-Private Function CreateHistoryBucket() As Variant
-    Dim bucket(0 To 2) As Double
-    bucket(0) = 0
-    bucket(1) = 0
-    bucket(2) = 0
-    CreateHistoryBucket = bucket
+Private Function CreateHistoryBucket() As Object
+    Dim bucket As Object
+    Set bucket = CreateObject("Scripting.Dictionary")
+    bucket.CompareMode = vbTextCompare
+    bucket("IncidentCount") = 0#
+    bucket("TotalFailedRecords") = 0#
+    bucket("TotalMissingAlerts") = 0#
+    bucket("PositiveIncidentCount") = 0#
+    bucket("MostRecentDate") = 0#
+    bucket("MostRecentFailedRecords") = 0#
+    bucket("MostRecentPercentImpacted") = 0#
+    bucket("MostRecentMissingAlerts") = 0#
+    Set CreateHistoryBucket = bucket
 End Function
+
+Private Sub EnsureHistoryTableLayout(ByVal tbl As ListObject)
+    Dim headers As Variant
+    headers = HistoryTableHeaders()
+
+    Dim columnCount As Long
+    columnCount = UBound(headers) - LBound(headers) + 1
+
+    Dim targetRange As Range
+    Set targetRange = tbl.Range.Resize(RowSize:=tbl.Range.Rows.Count, ColumnSize:=columnCount)
+    tbl.Resize targetRange
+
+    Dim headerRange As Range
+    Set headerRange = tbl.HeaderRowRange
+
+    Dim i As Long
+    For i = 1 To columnCount
+        headerRange.Cells(1, i).Value = headers(i - 1)
+    Next i
+End Sub
+
+Private Function HistoryTableHeaders() As Variant
+    HistoryTableHeaders = VBA.Array("Incident_Date", "Source_System", "Asset_Class", "Scenario_Name", "Model_Family", "Failed_Records", "Pct_Records_Impacted", "Missing_Alerts", "Serial_Number")
+End Function
+
+Private Sub UpdateHistoryNamedRanges(ByVal tbl As ListObject)
+    AssignHistoryNamedRange "HistoryIncidentDates", tbl, "Incident_Date"
+    AssignHistoryNamedRange "HistoryFailedRecords", tbl, "Failed_Records"
+    AssignHistoryNamedRange "HistoryPercentImpacted", tbl, "Pct_Records_Impacted"
+    AssignHistoryNamedRange "HistoryMissingAlerts", tbl, "Missing_Alerts"
+End Sub
+
+Private Sub AssignHistoryNamedRange(ByVal name As String, ByVal tbl As ListObject, ByVal columnName As String)
+    Dim listColumn As ListColumn
+    On Error Resume Next
+    Set listColumn = tbl.ListColumns(columnName)
+    On Error GoTo 0
+
+    If listColumn Is Nothing Then Exit Sub
+
+    Dim columnRange As Range
+    On Error Resume Next
+    Set columnRange = listColumn.DataBodyRange
+    On Error GoTo 0
+
+    If columnRange Is Nothing Then
+        Set columnRange = listColumn.Range.Offset(1, 0).Resize(1)
+    End If
+
+    If columnRange Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    ThisWorkbook.Names(name).Delete
+    On Error GoTo 0
+
+    ThisWorkbook.Names.Add Name:=name, RefersTo:=columnRange
+End Sub
 
 Private Function SplitScenarios(ByVal value As String) As Variant
     Dim trimmed As String
