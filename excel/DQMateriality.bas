@@ -1714,27 +1714,42 @@ End Function
 
 Private Function LoadTableData(ByVal sheetName As String, ByVal tableName As String) As Variant
     Dim tbl As ListObject
-    Set tbl = ThisWorkbook.Worksheets(sheetName).ListObjects(tableName)
+    Set tbl = GetTableIfExists(sheetName, tableName)
+
+    If tbl Is Nothing Then
+        NotifyMissingConfig tableName
+        LoadTableData = VBA.Array()
+        Exit Function
+    End If
 
     If tbl.ListRows.Count = 0 Then
+        NotifyMissingConfig tableName
         LoadTableData = VBA.Array()
-    Else
-        LoadTableData = tbl.DataBodyRange.Value
+        Exit Function
     End If
+
+    LoadTableData = tbl.DataBodyRange.Value
 End Function
 
 Private Function LoadDQMatrix() As Object
     Dim tbl As ListObject
-    Set tbl = ThisWorkbook.Worksheets(SHEET_CONFIG).ListObjects(TABLE_DQMATRIX)
-
-    Dim headers As Variant
-    headers = tbl.HeaderRowRange.Value
+    Set tbl = GetTableIfExists(SHEET_CONFIG, TABLE_DQMATRIX)
 
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
 
+    If tbl Is Nothing Then
+        NotifyMissingConfig TABLE_DQMATRIX
+        Set LoadDQMatrix = dict
+        Exit Function
+    End If
+
+    Dim headers As Variant
+    headers = tbl.HeaderRowRange.Value
+
     Dim data As Variant
     If tbl.ListRows.Count = 0 Then
+        NotifyMissingConfig TABLE_DQMATRIX
         Set LoadDQMatrix = dict
         Exit Function
     End If
