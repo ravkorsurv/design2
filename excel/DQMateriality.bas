@@ -416,9 +416,16 @@ Private Function BuildHistoryRollup() As Object
         failedRecords = NzDouble(data(r, indexes.FailedRecords))
         bucket("TotalFailedRecords") = bucket("TotalFailedRecords") + failedRecords
 
+        Dim percentImpacted As Double
+        percentImpacted = NzDouble(data(r, indexes.PercentImpacted))
+
         Dim missingAlerts As Double
         missingAlerts = NzDouble(data(r, indexes.MissingAlerts))
         bucket("TotalMissingAlerts") = bucket("TotalMissingAlerts") + missingAlerts
+
+        If (missingAlerts > 0#) Or (percentImpacted > 0#) Then
+            bucket("PositiveIncidents") = bucket("PositiveIncidents") + 1
+        End If
 
         bucket("IncidentCount") = bucket("IncidentCount") + 1
 
@@ -499,6 +506,36 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     Dim materialityScore As Double
     materialityScore = missedAlerts * materialityRatio
 
+    Dim positiveIncidents As Double
+    If bucket.Exists("PositiveIncidents") Then
+        positiveIncidents = bucket("PositiveIncidents")
+    Else
+        positiveIncidents = 0#
+    End If
+
+    Dim negativeIncidents As Double
+    negativeIncidents = bucket("IncidentCount") - positiveIncidents
+    If negativeIncidents < 0# Then negativeIncidents = 0#
+
+    Dim jeffreysAlpha As Double
+    jeffreysAlpha = positiveIncidents + 0.5
+
+    Dim jeffreysBeta As Double
+    jeffreysBeta = negativeIncidents + 0.5
+
+    Dim storRateMean As Double
+    If (jeffreysAlpha + jeffreysBeta) = 0# Then
+        storRateMean = 0#
+    Else
+        storRateMean = jeffreysAlpha / (jeffreysAlpha + jeffreysBeta)
+    End If
+
+    Dim storRateUpper95 As Double
+    storRateUpper95 = ComputeBetaInverse(0.95, jeffreysAlpha, jeffreysBeta)
+
+    Dim jeffreysMateriality As Double
+    jeffreysMateriality = materialityScore * storRateUpper95
+
     Dim noteText As String
     If bucket("IncidentCount") = 0 Then
         noteText = "No lookback history available for " & sourceSystem & " / " & scenarioName
@@ -527,17 +564,175 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     result(13) = dqFinal
     result(14) = materialityRatio
     result(15) = materialityScore
-    result(16) = Empty
-    result(17) = Empty
-    result(18) = Empty
-    result(19) = Empty
-    result(20) = Empty
+    result(16) = jeffreysAlpha
+    result(17) = jeffreysBeta
+    result(18) = storRateMean
+    result(19) = storRateUpper95
+    result(20) = jeffreysMateriality
     result(21) = runTimestamp
     result(22) = runUser
     result(23) = workbookVersion
     result(24) = noteText
 
     BuildOutputRow = result
+End Function
+
+Private Function ComputeBetaInverse(ByVal probability As Double, ByVal alpha As Double, ByVal beta As Double) As Double
+    If probability <= 0# Then
+        ComputeBetaInverse = 0#
+        Exit Function
+    ElseIf probability >= 1# Then
+        ComputeBetaInverse = 1#
+        Exit Function
+    End If
+
+    Dim resultValue As Double
+    On Error Resume Next
+    resultValue = Application.WorksheetFunction.Beta_Inv(probability, alpha, beta)
+    If Err.Number = 0 Then
+        ComputeBetaInverse = resultValue
+        Exit Function
+    End If
+
+    Err.Clear
+    resultValue = Application.WorksheetFunction.BetaInv(probability, alpha, beta)
+    If Err.Number = 0 Then
+        ComputeBetaInverse = resultValue
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    ComputeBetaInverse = BetaInverseFallback(probability, alpha, beta)
+End Function
+
+Private Function BetaInverseFallback(ByVal probability As Double, ByVal alpha As Double, ByVal beta As Double) As Double
+    Dim lower As Double
+    Dim upper As Double
+    lower = 0#
+    upper = 1#
+
+    Dim mid As Double
+    Dim iter As Long
+    For iter = 1 To 60
+        mid = (lower + upper) / 2#
+        Dim cdf As Double
+        cdf = RegularizedIncompleteBeta(mid, alpha, beta)
+        If cdf > probability Then
+            upper = mid
+        Else
+            lower = mid
+        End If
+    Next iter
+
+    BetaInverseFallback = (lower + upper) / 2#
+End Function
+
+Private Function RegularizedIncompleteBeta(ByVal x As Double, ByVal a As Double, ByVal b As Double) As Double
+    If x <= 0# Then
+        RegularizedIncompleteBeta = 0#
+        Exit Function
+    ElseIf x >= 1# Then
+        RegularizedIncompleteBeta = 1#
+        Exit Function
+    End If
+
+    Dim bt As Double
+    bt = Exp(LogGamma(a + b) - LogGamma(a) - LogGamma(b) + a * Log(x) + b * Log(1# - x))
+
+    Dim resultValue As Double
+    If x < (a + 1#) / (a + b + 2#) Then
+        resultValue = bt * BetaContinuedFraction(x, a, b) / a
+    Else
+        resultValue = 1# - bt * BetaContinuedFraction(1# - x, b, a) / b
+    End If
+
+    If resultValue < 0# Then
+        resultValue = 0#
+    ElseIf resultValue > 1# Then
+        resultValue = 1#
+    End If
+
+    RegularizedIncompleteBeta = resultValue
+End Function
+
+Private Function BetaContinuedFraction(ByVal x As Double, ByVal a As Double, ByVal b As Double) As Double
+    Const MAX_ITER As Long = 200
+    Const EPS As Double = 3E-7
+    Const FPMIN As Double = 1E-30
+
+    Dim qab As Double
+    Dim qap As Double
+    Dim qam As Double
+    qab = a + b
+    qap = a + 1#
+    qam = a - 1#
+
+    Dim c As Double
+    Dim d As Double
+    Dim h As Double
+
+    c = 1#
+    d = 1# - (qab * x / qap)
+    If Abs(d) < FPMIN Then d = FPMIN
+    d = 1# / d
+    h = d
+
+    Dim m As Long
+    For m = 1 To MAX_ITER
+        Dim m2 As Long
+        m2 = 2 * m
+
+        Dim aa As Double
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1# + aa * d
+        If Abs(d) < FPMIN Then d = FPMIN
+        c = 1# + aa / c
+        If Abs(c) < FPMIN Then c = FPMIN
+        d = 1# / d
+        h = h * d * c
+
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1# + aa * d
+        If Abs(d) < FPMIN Then d = FPMIN
+        c = 1# + aa / c
+        If Abs(c) < FPMIN Then c = FPMIN
+        d = 1# / d
+        Dim delta As Double
+        delta = d * c
+        h = h * delta
+
+        If Abs(delta - 1#) < EPS Then Exit For
+    Next m
+
+    BetaContinuedFraction = h
+End Function
+
+Private Function LogGamma(ByVal z As Double) As Double
+    Const g As Double = 7
+    Const PI_CONST As Double = 3.14159265358979#
+    Dim p As Variant
+    p = Array(0.99999999999980993#, 676.5203681218851#, -1259.1392167224028#, _
+              771.32342877765313#, -176.61502916214059#, 12.507343278686905#, _
+              -0.13857109526572012#, 9.9843695780195716E-6, 1.5056327351493116E-7)
+
+    If z < 0.5 Then
+        LogGamma = Log(PI_CONST) - Log(Sin(PI_CONST * z)) - LogGamma(1# - z)
+        Exit Function
+    End If
+
+    z = z - 1#
+    Dim x As Double
+    x = p(0)
+
+    Dim i As Long
+    For i = 1 To UBound(p)
+        x = x + p(i) / (z + i)
+    Next i
+
+    Dim t As Double
+    t = z + g + 0.5
+
+    LogGamma = 0.5 * Log(2# * PI_CONST) + (z + 0.5) * Log(t) - t + Log(x)
 End Function
 
 Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As Date) As Variant
@@ -1721,6 +1916,7 @@ Private Function CreateHistoryBucket() As Object
     Set bucket = CreateObject("Scripting.Dictionary")
     bucket.CompareMode = vbTextCompare
     bucket("IncidentCount") = 0#
+    bucket("PositiveIncidents") = 0#
     bucket("TotalFailedRecords") = 0#
     bucket("TotalMissingAlerts") = 0#
     Set CreateHistoryBucket = bucket
