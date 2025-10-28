@@ -1,0 +1,32 @@
+[
+  {
+    "name": "aggregate_duplicates",
+    "scenarios_text": "Spoofing, Wash Trades",
+    "potential_text": "Spoofing (1,200)\r\nWash Trades (4.5)\r\nSpoofing (0.5)",
+    "fallback_scenario": "",
+    "expected": [
+      {"Scenario": "Spoofing", "MissingAlerts": 1200.5},
+      {"Scenario": "Wash Trades", "MissingAlerts": 4.5}
+    ]
+  },
+  {
+    "name": "fallback_when_empty",
+    "scenarios_text": "",
+    "potential_text": "",
+    "fallback_scenario": "",
+    "expected": [
+      {"Scenario": "Unspecified", "MissingAlerts": 0.0}
+    ]
+  },
+  {
+    "name": "scenario_without_potential",
+    "scenarios_text": "Layering, Spoofing, Quote Stuffing",
+    "potential_text": "Layering (2)\r\nSpoofing (3)",
+    "fallback_scenario": "",
+    "expected": [
+      {"Scenario": "Layering", "MissingAlerts": 2.0},
+      {"Scenario": "Spoofing", "MissingAlerts": 3.0},
+      {"Scenario": "Quote Stuffing", "MissingAlerts": 0.0}
+    ]
+  }
+]
