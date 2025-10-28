@@ -14,10 +14,10 @@ Option Explicit
 '       * SeverityThresholds (columns: MinPct, Severity, optional Description)
 '       * LikelihoodThresholds (columns: MinImpact, Band)
 '       * DQMatrix (first column Severity, subsequent columns named for bands)
-'   - Named ranges on Config sheet:
-'       * Config_LookbackDays (number of days for history window)
-'       * Config_RunUser (current analyst/user string)
-'       * Config_WorkbookVersion (text identifier)
+'   - Configuration checklist (all must be defined as single-cell named ranges):
+'       * Config_LookbackDays  → numeric days for the rolling history window
+'       * Config_RunUser       → analyst/user string recorded in the audit log
+'       * Config_WorkbookVersion → workbook/version identifier stamped on output
 '
 ' The workbook only relies on Excel/VBA features (no external add-ins).  All
 ' calculations are orchestrated via the RunDQMateriality macro below.
@@ -407,8 +407,21 @@ Private Function BuildHistoryRollup() As Object
     Dim indexes As IncidentColumnIndexes
     indexes = BuildIncidentColumnIndexes(headerMap)
 
+    Dim lookbackValue As Variant
+    lookbackValue = GetNamedRange("Config_LookbackDays")
+    If IsEmpty(lookbackValue) Then
+        MsgBox "Config_LookbackDays named range is missing; unable to build history rollup.", vbExclamation
+        Set BuildHistoryRollup = dict
+        Exit Function
+    End If
+    If Not IsNumeric(lookbackValue) Then
+        MsgBox "Config_LookbackDays must be numeric; unable to build history rollup.", vbExclamation
+        Set BuildHistoryRollup = dict
+        Exit Function
+    End If
+
     Dim lookbackDays As Long
-    lookbackDays = CLng(GetNamedRange("Config_LookbackDays"))
+    lookbackDays = CLng(lookbackValue)
 
     Dim windowStart As Date
     windowStart = Date - lookbackDays
@@ -799,11 +812,25 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
     Dim materialityRatios As Object
     Set materialityRatios = LoadMaterialityRatios()
 
+    Dim workbookVersionValue As Variant
+    workbookVersionValue = GetNamedRange("Config_WorkbookVersion")
     Dim workbookVersion As String
-    workbookVersion = CStr(GetNamedRange("Config_WorkbookVersion"))
+    If IsEmpty(workbookVersionValue) Then
+        workbookVersion = "(missing Config_WorkbookVersion)"
+        MsgBox "Config_WorkbookVersion named range is missing; defaulting workbook version output.", vbExclamation
+    Else
+        workbookVersion = CStr(workbookVersionValue)
+    End If
 
+    Dim runUserValue As Variant
+    runUserValue = GetNamedRange("Config_RunUser")
     Dim runUser As String
-    runUser = CStr(GetNamedRange("Config_RunUser"))
+    If IsEmpty(runUserValue) Then
+        runUser = "(unknown user)"
+        MsgBox "Config_RunUser named range is missing; defaulting to '(unknown user)'.", vbExclamation
+    Else
+        runUser = CStr(runUserValue)
+    End If
 
     Dim rowValues As Variant
     Dim outCol As Long
@@ -1499,8 +1526,21 @@ Private Sub WriteHistoryFromIncidents()
     Dim indexes As IncidentColumnIndexes
     indexes = BuildIncidentColumnIndexes(headerMap)
 
+    Dim lookbackValue As Variant
+    lookbackValue = GetNamedRange("Config_LookbackDays")
+    If IsEmpty(lookbackValue) Then
+        MsgBox "Config_LookbackDays named range is missing; unable to update history.", vbExclamation
+        UpdateHistoryNamedRanges historyTable
+        Exit Sub
+    End If
+    If Not IsNumeric(lookbackValue) Then
+        MsgBox "Config_LookbackDays must be numeric; unable to update history.", vbExclamation
+        UpdateHistoryNamedRanges historyTable
+        Exit Sub
+    End If
+
     Dim lookbackDays As Long
-    lookbackDays = CLng(GetNamedRange("Config_LookbackDays"))
+    lookbackDays = CLng(lookbackValue)
 
     Dim windowStart As Date
     windowStart = Date - lookbackDays
@@ -1564,8 +1604,15 @@ Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date, 
     Dim tbl As ListObject
     Set tbl = wb.Worksheets(SHEET_AUDIT).ListObjects(TABLE_AUDIT)
 
+    Dim runUserValue As Variant
+    runUserValue = GetNamedRange("Config_RunUser")
     Dim runUser As String
-    runUser = CStr(GetNamedRange("Config_RunUser"))
+    If IsEmpty(runUserValue) Then
+        runUser = "(unknown user)"
+        MsgBox "Config_RunUser named range is missing; audit log will record '(unknown user)'.", vbExclamation
+    Else
+        runUser = CStr(runUserValue)
+    End If
 
     Dim newRow As ListRow
     Set newRow = tbl.ListRows.Add
@@ -1951,7 +1998,42 @@ Private Function BuildHistoryKey(ByVal sourceSystem As String, ByVal scenarioNam
 End Function
 
 Private Function GetNamedRange(ByVal name As String) As Variant
-    GetNamedRange = ThisWorkbook.Names(name).RefersToRange.Value
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+    Dim namedRange As Name
+    On Error Resume Next
+    Set namedRange = wb.Names(name)
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        GetNamedRange = Empty
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    If namedRange Is Nothing Then
+        GetNamedRange = Empty
+        Exit Function
+    End If
+
+    Dim targetRange As Range
+    On Error Resume Next
+    Set targetRange = namedRange.RefersToRange
+    If Err.Number <> 0 Then
+        Dim errorText As String
+        errorText = "Named range '" & name & "' does not refer to a valid worksheet range."
+        Err.Clear
+        On Error GoTo 0
+        Err.Raise vbObjectError + 513, "GetNamedRange", errorText
+    End If
+    On Error GoTo 0
+
+    If targetRange Is Nothing Then
+        Err.Raise vbObjectError + 514, "GetNamedRange", "Named range '" & name & "' is empty or invalid."
+    End If
+
+    GetNamedRange = targetRange.Value
 End Function
 
 Private Function CreateHistoryBucket() As Object
