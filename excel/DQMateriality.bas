@@ -75,6 +75,8 @@ Private Const TABLE_STS_ALERTS As String = "STSAlertsRaw"
 Private Const TABLE_ALERT_SUMMARY As String = "AlertSummary"
 
 Public Sub RunDQMateriality()
+    On Error GoTo HandleError
+
     Dim runTimestamp As Date
     runTimestamp = Now
 
@@ -94,6 +96,30 @@ Public Sub RunDQMateriality()
     RefreshAlertSummary False
 
     MsgBox "DQ/materiality calculations complete", vbInformation
+    Exit Sub
+
+HandleError:
+    Dim errorMessage As String
+    errorMessage = Err.Description
+
+    On Error Resume Next
+    AppendAuditEntry Empty, runTimestamp, errorMessage
+
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+    Dim historyTable As ListObject
+    Set historyTable = wb.Worksheets(SHEET_HISTORY).ListObjects(TABLE_HISTORY_RAW)
+    ClearTable historyTable
+
+    Dim outputTable As ListObject
+    Set outputTable = wb.Worksheets(SHEET_OUTPUT).ListObjects(TABLE_OUTPUT)
+    ClearTable outputTable
+    On Error GoTo 0
+
+    MsgBox "DQ/materiality calculations failed. " & _
+           "See AuditLog entry for " & Format$(runTimestamp, "yyyy-mm-dd hh:nn:ss") & "." & vbCrLf & _
+           "Details: " & errorMessage, vbCritical
 End Sub
 
 Public Sub ExpandIncidents()
@@ -1531,15 +1557,12 @@ ContinueRow:
     UpdateHistoryNamedRanges historyTable
 End Sub
 
-Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date)
+Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date, Optional ByVal errorMessage As String = "")
     Dim wb As Workbook
     Set wb = ThisWorkbook
 
     Dim tbl As ListObject
     Set tbl = wb.Worksheets(SHEET_AUDIT).ListObjects(TABLE_AUDIT)
-
-    Dim digest As String
-    digest = ComputeRowsDigest(rows)
 
     Dim runUser As String
     runUser = CStr(GetNamedRange("Config_RunUser"))
@@ -1551,8 +1574,13 @@ Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date)
     Set target = newRow.Range
     target.Cells(1, 1).Value = runTimestamp
     target.Cells(1, 2).Value = runUser
-    target.Cells(1, 3).Value = ArrayRowCount(rows)
-    target.Cells(1, 4).Value = digest
+    If LenB(errorMessage) = 0 Then
+        target.Cells(1, 3).Value = ArrayRowCount(rows)
+        target.Cells(1, 4).Value = ComputeRowsDigest(rows)
+    Else
+        target.Cells(1, 3).Value = ""
+        target.Cells(1, 4).Value = "ERROR: " & errorMessage
+    End If
 End Sub
 
 Private Function ComputeRowsDigest(ByVal rows As Variant) As String
