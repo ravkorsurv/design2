@@ -52,6 +52,9 @@ Private Type IncidentColumnIndexes
     SerialNumber As Long
 End Type
 
+' Build a strongly-typed structure of the column offsets used throughout the
+' module so that later calculations can access columns via named fields rather
+' than repeatedly looking up header strings.
 Private Function BuildIncidentColumnIndexes(ByVal headerMap As Object) As IncidentColumnIndexes
     Dim indexes As IncidentColumnIndexes
 
@@ -72,8 +75,17 @@ End Function
 Private Const TABLE_MATERIAL_CATEGORIES As String = "MaterialCategories"
 Private Const TABLE_MATERIAL_OUTPUTS As String = "MaterialOutputsRaw"
 Private Const TABLE_STS_ALERTS As String = "STSAlertsRaw"
+' Table and sheet names used by downstream reporting worksheets.
 Private Const TABLE_ALERT_SUMMARY As String = "AlertSummary"
 
+' Entry point for the workflow.  Each call orchestrates a full refresh by:
+'   1. Expanding the raw incident feed into per-scenario rows
+'   2. Rebuilding the historical lookback metrics
+'   3. Computing the current materiality outputs
+'   4. Writing results and logging the execution
+'   5. Refreshing the alert summary dashboard
+' Any failure during these steps is surfaced to the analyst and recorded in the
+' audit log so the workbook does not silently stay in a bad state.
 Public Sub RunDQMateriality()
     On Error GoTo HandleError
 
@@ -122,6 +134,9 @@ HandleError:
            "Details: " & errorMessage, vbCritical
 End Sub
 
+' Normalize and explode the incident feed so that each scenario/materiality pair
+' becomes an individual row.  The expanded table drives all downstream metrics
+' that expect a single scenario per record rather than comma-delimited text.
 Public Sub ExpandIncidents()
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -136,6 +151,7 @@ Public Sub ExpandIncidents()
 
     If srcTable.ListRows.Count = 0 Then Exit Sub
 
+    ' Cache the source data locally to minimize worksheet round-trips.
     Dim data As Variant
     data = srcTable.DataBodyRange.Value
 
@@ -153,6 +169,9 @@ Public Sub ExpandIncidents()
 
     Dim r As Long
     For r = 1 To UBound(data, 1)
+        ' Each raw incident can list multiple scenario/materiality pairs in a
+        ' single cell; we keep the identifying fields constant while iterating
+        ' through the parsed scenario items.
         Dim incidentId As String
         incidentId = NzString(data(r, headerMap("Serial Number")))
 
@@ -181,11 +200,16 @@ Public Sub ExpandIncidents()
         Dim potentialText As String
         potentialText = NzString(data(r, headerMap("Potential missing alerts per scenario")))
 
+        ' Parse the multi-value text fields into a structured collection that
+        ' includes both scenario names and derived missing-alert counts.
         Dim scenarioImpacts As Collection
         Set scenarioImpacts = ParseScenarioMateriality(scenariosText, potentialText, sourceSystem)
 
         Dim impactItem As Variant
         For Each impactItem In scenarioImpacts
+            ' Build the row to append to the expanded table.  Columns 1–6 copy
+            ' attributes from the incident; columns 7–9 track the scenario-level
+            ' materiality details used later in scoring.
             Dim rowValues(1 To 9) As Variant
             rowValues(1) = incidentId
             rowValues(2) = sourceSystem
@@ -214,10 +238,15 @@ Public Sub ExpandIncidents()
         Next c
     Next i
 
+    ' Resize and populate the destination table in a single assignment so Excel
+    ' recalculates efficiently even when thousands of rows are added.
     dstTable.Resize dstTable.Range.Resize(RowSize:=outRows.Count + 1)
     dstTable.DataBodyRange.Value = outputData
 End Sub
 
+' Load the optional configuration table that maps scenario names to broader
+' model families.  The lookup is case-insensitive and gracefully falls back to
+' the scenario name itself if the table is missing or incomplete.
 Private Function LoadScenarioFamilies() As Object
     Dim dict As Object
     Set dict = NewDictionary()
@@ -254,6 +283,8 @@ Private Function LoadScenarioFamilies() As Object
         Exit Function
     End If
 
+    ' Populate the dictionary with normalized scenario names so downstream
+    ' lookups remain stable even if the source data varies in casing or spacing.
     Dim r As Long
     For r = 1 To UBound(data, 1)
         Dim scenarioName As String
@@ -270,6 +301,9 @@ Private Function LoadScenarioFamilies() As Object
     Set LoadScenarioFamilies = dict
 End Function
 
+' Helper that resolves a scenario's model family using the optional lookup
+' table.  When no match is available the normalized scenario name (or a
+' friendly "Unspecified") value is returned so the UI never shows a blank.
 Private Function LookupModelFamily(ByVal scenarioName As String, ByVal familyMap As Object) As String
     Dim normalized As String
     normalized = NormalizeScenarioName(scenarioName)
@@ -288,17 +322,26 @@ Private Function LookupModelFamily(ByVal scenarioName As String, ByVal familyMap
     LookupModelFamily = normalized
 End Function
 
+' Parse the free-form scenario/missing alert strings supplied in the incident
+' feed.  The function returns a collection of dictionaries, each containing
+' the normalized scenario name and the associated missing-alert count.  When
+' the feed omits scenario information the function injects a fallback record so
+' downstream aggregations remain balanced.
 Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
                                           ByVal potentialText As String, _
                                           ByVal fallbackScenario As String) As Collection
     Dim impacts As New Collection
 
+    ' scenarioSet tracks all distinct scenarios referenced in either field so we
+    ' can emit a single row per scenario even if it appears multiple times.
     Dim scenarioSet As Object
     Set scenarioSet = CreateObject("Scripting.Dictionary")
     On Error Resume Next
     scenarioSet.CompareMode = vbTextCompare
     On Error GoTo 0
 
+    ' potentialDict aggregates the numeric "missing alert" quantities by
+    ' normalized scenario name.
     Dim potentialDict As Object
     Set potentialDict = CreateObject("Scripting.Dictionary")
     On Error Resume Next
@@ -312,6 +355,8 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
     Set matches = rx.Execute(potentialText)
 
     Dim i As Long
+    ' The potential text contains lines such as "Scenario (123)"; extract both
+    ' capture groups from each regex match.
     For i = 0 To matches.Count - 1
         Dim match As Object
         Set match = matches(i)
@@ -331,6 +376,7 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
         scenarioSet(scenarioName) = True
     Next i
 
+    ' Split the comma-delimited scenario list that accompanies the potential text.
     Dim rawScenarios As Variant
     rawScenarios = SplitScenarios(scenariosText)
 
@@ -344,6 +390,9 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
         Next i
     End If
 
+    ' If neither text field yields a scenario, fall back to the incident's source
+    ' system or a friendly "Unspecified" marker so downstream logic still
+    ' processes at least one row.
     If scenarioSet.Count = 0 Then
         Dim defaultScenario As String
         defaultScenario = NormalizeScenarioName(fallbackScenario)
@@ -351,6 +400,8 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
         scenarioSet(defaultScenario) = True
     End If
 
+    ' Build a small dictionary for each unique scenario so callers can pull the
+    ' name and alert count without parsing again.
     Dim scenarioKey As Variant
     For Each scenarioKey In scenarioSet.Keys
         Dim entry As Object
@@ -367,6 +418,9 @@ Private Function ParseScenarioMateriality(ByVal scenariosText As String, _
     Set ParseScenarioMateriality = impacts
 End Function
 
+' Lazily build the regular expression that extracts "Scenario (count)" pairs
+' from the potential missing alert text.  We cache the RegExp object so repeated
+' calls avoid re-compiling the pattern.
 Private Function GetScenarioRegex() As Object
     Static scenarioRegex As Object
 
@@ -380,6 +434,9 @@ Private Function GetScenarioRegex() As Object
     Set GetScenarioRegex = scenarioRegex
 End Function
 
+' Aggregate the expanded incidents into a nested dictionary keyed by
+' source-system / scenario / model family.  Each bucket accumulates counts and
+' sums required for scoring, limited to the analyst-configured lookback window.
 Private Function BuildHistoryRollup() As Object
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -407,6 +464,8 @@ Private Function BuildHistoryRollup() As Object
     Dim indexes As IncidentColumnIndexes
     indexes = BuildIncidentColumnIndexes(headerMap)
 
+    ' Ensure the lookback window is configured so we do not accidentally include
+    ' the entire historical dataset.
     Dim lookbackValue As Variant
     lookbackValue = GetNamedRange("Config_LookbackDays")
     If IsEmpty(lookbackValue) Then
@@ -453,6 +512,8 @@ Private Function BuildHistoryRollup() As Object
 
         Dim failedRecords As Double
         failedRecords = NzDouble(data(r, indexes.FailedRecords))
+        ' Track how many records failed validation so we can compute historical
+        ' alert rates for each bucket.
         bucket("TotalFailedRecords") = bucket("TotalFailedRecords") + failedRecords
 
         Dim percentImpacted As Double
@@ -460,12 +521,19 @@ Private Function BuildHistoryRollup() As Object
 
         Dim missingAlerts As Double
         missingAlerts = NzDouble(data(r, indexes.MissingAlerts))
+        ' Missing alerts capture the estimated downstream impact of each
+        ' incident.  Summing them across the lookback window feeds the
+        ' likelihood scoring later on.
         bucket("TotalMissingAlerts") = bucket("TotalMissingAlerts") + missingAlerts
 
         If (missingAlerts > 0#) Or (percentImpacted > 0#) Then
+            ' Positive incidents represent data-quality breaches with a measurable
+            ' impact, used for the Jeffreys prior calculation.
             bucket("PositiveIncidents") = bucket("PositiveIncidents") + 1
         End If
 
+        ' Keep a raw count so we can derive complementary negative-incident
+        ' values without an extra loop.
         bucket("IncidentCount") = bucket("IncidentCount") + 1
 
         Set dict(key) = bucket
@@ -475,6 +543,10 @@ ContinueRow:
     Set BuildHistoryRollup = dict
 End Function
 
+' Translate a single expanded incident row into the 24-column output schema by
+' combining current incident attributes with historical context and configured
+' scoring thresholds.  The result array feeds directly into the OutputResults
+' table for efficient bulk writes.
 Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, ByVal indexes As IncidentColumnIndexes, ByVal rollup As Object, ByVal severityTable As Variant, ByVal likelihoodTable As Variant, ByVal dqMatrix As Object, ByVal materialityRatios As Object, ByVal runTimestamp As Date, ByVal runUser As String, ByVal workbookVersion As String) As Variant
     Dim sourceSystem As String
     sourceSystem = NzString(data(rowIndex, indexes.SourceSystem))
@@ -503,6 +575,8 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     Dim incidentId As String
     incidentId = NzString(data(rowIndex, indexes.SerialNumber))
 
+    ' Locate the matching history bucket so we can reuse lookback totals when
+    ' calculating alert rates and Jeffreys parameters.
     Dim historyKey As String
     historyKey = BuildHistoryKey(sourceSystem, scenarioName, modelFamily)
 
@@ -519,6 +593,9 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     Dim totalMissingHistory As Double
     totalMissingHistory = bucket("TotalMissingAlerts")
 
+    ' Historical alert rate is the proportion of missing alerts observed in the
+    ' lookback window for the given key.  If no history exists we default to 0 to
+    ' avoid division errors.
     Dim historyAlertRate As Double
     If totalFailedHistory = 0 Then
         historyAlertRate = 0
@@ -542,6 +619,8 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     Dim ratioFound As Boolean
     materialityRatio = ResolveMaterialityRatio(assetClass, dqFinal, materialityRatios, ratioFound)
 
+    ' Convert the raw missed-alert estimate into a scaled score using the
+    ' risk-based multipliers configured per asset class and risk band.
     Dim materialityScore As Double
     materialityScore = missedAlerts * materialityRatio
 
@@ -562,6 +641,7 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     Dim jeffreysBeta As Double
     jeffreysBeta = negativeIncidents + 0.5
 
+    ' Apply a Jeffreys prior to stabilize ratios when limited data exists.
     Dim storRateMean As Double
     If (jeffreysAlpha + jeffreysBeta) = 0# Then
         storRateMean = 0#
@@ -616,6 +696,9 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     BuildOutputRow = result
 End Function
 
+' Wrapper around Excel's BETAINV functions with a deterministic numerical
+' fallback when the worksheet functions are unavailable (e.g. older Excel
+' versions or Analysis ToolPak disabled).
 Private Function ComputeBetaInverse(ByVal probability As Double, ByVal alpha As Double, ByVal beta As Double) As Double
     If probability <= 0# Then
         ComputeBetaInverse = 0#
@@ -644,6 +727,9 @@ Private Function ComputeBetaInverse(ByVal probability As Double, ByVal alpha As 
     ComputeBetaInverse = BetaInverseFallback(probability, alpha, beta)
 End Function
 
+' Perform a simple binary search over [0,1] to approximate the inverse beta
+' cumulative distribution.  The iteration count balances accuracy with speed
+' for typical workbook usage.
 Private Function BetaInverseFallback(ByVal probability As Double, ByVal alpha As Double, ByVal beta As Double) As Double
     Dim lower As Double
     Dim upper As Double
@@ -666,6 +752,9 @@ Private Function BetaInverseFallback(ByVal probability As Double, ByVal alpha As
     BetaInverseFallback = (lower + upper) / 2#
 End Function
 
+' Compute the regularized incomplete beta function using the continued
+' fraction expansion described in Numerical Recipes.  This is required by the
+' manual beta inverse implementation above.
 Private Function RegularizedIncompleteBeta(ByVal x As Double, ByVal a As Double, ByVal b As Double) As Double
     If x <= 0# Then
         RegularizedIncompleteBeta = 0#
@@ -694,6 +783,9 @@ Private Function RegularizedIncompleteBeta(ByVal x As Double, ByVal a As Double,
     RegularizedIncompleteBeta = resultValue
 End Function
 
+' Evaluate the continued fraction used by RegularizedIncompleteBeta.  The
+' implementation mirrors the Lentz algorithm and guards against numerical
+' underflow when x approaches 0 or 1.
 Private Function BetaContinuedFraction(ByVal x As Double, ByVal a As Double, ByVal b As Double) As Double
     Const MAX_ITER As Long = 200
     Const EPS As Double = 3E-7
@@ -746,6 +838,8 @@ Private Function BetaContinuedFraction(ByVal x As Double, ByVal a As Double, ByV
     BetaContinuedFraction = h
 End Function
 
+' Lanczos approximation of ln(Gamma(z)) providing sufficient precision for the
+' probability calculations in this workbook without depending on WorksheetFunction.GammaLn.
 Private Function LogGamma(ByVal z As Double) As Double
     Const g As Double = 7
     Const PI_CONST As Double = 3.14159265358979#
@@ -774,6 +868,9 @@ Private Function LogGamma(ByVal z As Double) As Double
     LogGamma = 0.5 * Log(2# * PI_CONST) + (z + 0.5) * Log(t) - t + Log(x)
 End Function
 
+' Build the full output table in memory before writing to the worksheet.  This
+' keeps worksheet updates fast and ensures every output column stays aligned
+' even when optional configuration items are missing.
 Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As Date) As Variant
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -788,6 +885,7 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
         Exit Function
     End If
 
+    ' Pre-size the array so it can be assigned to the table range in one call.
     Dim outputRows() As Variant
     ReDim outputRows(1 To rowCount, 1 To 24)
 
@@ -846,6 +944,9 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
     ComputeOutputRows = outputRows
 End Function
 
+' Rebuild the high-level alert summary dashboard.  The optional confirmation
+' dialog keeps existing workbook UX behaviour for manual refreshes while
+' allowing silent updates during the main RunDQMateriality workflow.
 Public Sub RefreshAlertSummary(Optional ByVal showConfirmation As Boolean = True)
     Dim summaryTable As ListObject
     Set summaryTable = GetTableIfExists(SHEET_METRICS, TABLE_ALERT_SUMMARY)
@@ -868,11 +969,16 @@ Public Sub RefreshAlertSummary(Optional ByVal showConfirmation As Boolean = True
     End If
 End Sub
 
+' Collect source data for the metrics dashboard by combining material output,
+' STS alert, and configuration tables.  The procedure builds row definitions and
+' aligned counts that are later written to the summary table.
 Private Sub BuildAlertSummary(ByRef summaryData As Variant, ByRef assetClasses As Collection, ByRef assetLabels As Object)
     Dim categories As Collection
     Dim storFlags As Object
     Call LoadMaterialCategories(categories, storFlags)
 
+    ' Track which configured categories actually appear in the source data so we
+    ' can append any new/unmapped categories after iterating the canonical list.
     Dim categoriesSeen As Object
     Set categoriesSeen = NewDictionary()
 
@@ -1014,6 +1120,9 @@ Private Function ComputeRatio(ByVal numeratorDict As Object, ByVal denominatorDi
     End If
 End Function
 
+' Convenience factory for row-definition dictionaries consumed by the summary
+' builder.  Each row definition captures how a metric should be labeled and
+' which aggregations feed it.
 Private Function CreateRowDef(ByVal section As String, ByVal label As String, ByVal key As String, ByVal rowType As String, Optional ByVal isStor As Boolean = False) As Object
     Dim entry As Object
     Set entry = NewDictionary()
@@ -1025,6 +1134,8 @@ Private Function CreateRowDef(ByVal section As String, ByVal label As String, By
     Set CreateRowDef = entry
 End Function
 
+' Retrieve the configured material output categories along with optional STOR
+' flags that drive how the summary groups metrics.
 Private Sub LoadMaterialCategories(ByRef categories As Collection, ByRef storFlags As Object)
     Set categories = New Collection
     Set storFlags = NewDictionary()
@@ -1086,6 +1197,9 @@ ContinueRow:
     Next r
 End Sub
 
+' Aggregate the SWAT material output feed into counts and totals per category
+' and asset class.  Also records which categories were present for later
+' reconciliation.
 Private Sub LoadMaterialOutputs(ByVal materialCounts As Object, ByVal materialTotals As Object, ByVal storTotals As Object, ByVal categoriesSeen As Object, ByVal storFlags As Object, ByVal assetLabels As Object)
     Dim tbl As ListObject
     Set tbl = GetTableIfExists(SHEET_METRICS, TABLE_MATERIAL_OUTPUTS)
@@ -1154,6 +1268,8 @@ ContinueRow:
     Next r
 End Sub
 
+' Summarize the STS alert closure data by asset class and escalation level so
+' the dashboard can compare alert volumes with material outputs.
 Private Sub LoadSTSAlerts(ByVal alertCounts As Object, ByVal alertTotals As Object, ByVal levelInfo As Object, ByVal assetLabels As Object)
     Dim tbl As ListObject
     Set tbl = GetTableIfExists(SHEET_METRICS, TABLE_STS_ALERTS)
@@ -1211,6 +1327,8 @@ Private Sub LoadSTSAlerts(ByVal alertCounts As Object, ByVal alertTotals As Obje
     Next r
 End Sub
 
+' Identify whether a material output category should count toward STOR ratios.
+' We first look for an explicit mapping then fall back to a label check.
 Private Function DetermineStorFlag(ByVal categoryKey As String, ByVal categoryLabel As String, ByVal storFlags As Object) As Boolean
     If Not storFlags Is Nothing Then
         If storFlags.Exists(categoryKey) Then
@@ -1300,6 +1418,9 @@ Private Sub SortVariantArray(ByRef values As Variant)
     Next i
 End Sub
 
+' Produce an ordered list of asset class keys that appear in either the
+' material output or STS alert sources.  The function also ensures a friendly
+' label exists for every key so the summary table headings remain readable.
 Private Function BuildAssetClassList(ByVal materialTotals As Object, ByVal alertTotals As Object, ByVal assetLabels As Object) As Collection
     Dim combined As Object
     Set combined = NewDictionary()
@@ -1361,6 +1482,7 @@ Private Function BuildAssetClassList(ByVal materialTotals As Object, ByVal alert
     Set BuildAssetClassList = result
 End Function
 
+' Convenience helper that creates a case-insensitive scripting dictionary.
 Private Function NewDictionary() As Object
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
@@ -1390,6 +1512,9 @@ Private Function CompoundKey(ByVal leftKey As String, ByVal rightKey As String) 
     CompoundKey = NormalizeScenarioName(leftKey) & "|" & NormalizeScenarioName(rightKey)
 End Function
 
+' Resize and populate the alert summary table headers and body in one pass,
+' ensuring that the section/metric columns plus any dynamic asset class columns
+' stay in sync with the calculated data array.
 Private Sub WriteSummaryTable(ByVal summaryTable As ListObject, ByVal summaryData As Variant, ByVal assetClasses As Collection, ByVal assetLabels As Object)
     Dim columnCount As Long
     If assetClasses Is Nothing Then
@@ -1482,6 +1607,9 @@ Private Function ToBoolean(ByVal value As Variant) As Boolean
     End If
 End Function
 
+' Persist the computed output rows to the OutputResults table.  The routine
+' clears any previous data and then writes the pre-sized array in a single
+' batch for performance.
 Private Sub WriteOutput(ByVal rows As Variant)
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -1499,6 +1627,9 @@ Private Sub WriteOutput(ByVal rows As Variant)
     tbl.DataBodyRange.Value = rows
 End Sub
 
+' Repopulate the HistoryRaw table with the lookback-filtered incidents.  The
+' table mirrors the expanded incident structure and drives downstream charts
+' through named ranges updated at the end of the routine.
 Private Sub WriteHistoryFromIncidents()
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -1517,6 +1648,7 @@ Private Sub WriteHistoryFromIncidents()
         Exit Sub
     End If
 
+    ' Load incident rows into memory for faster filtering.
     Dim data As Variant
     data = srcTable.DataBodyRange.Value
 
@@ -1554,6 +1686,8 @@ Private Sub WriteHistoryFromIncidents()
         incidentDate = NzDate(data(r, indexes.IncidentDate))
         If incidentDate < windowStart Then GoTo ContinueRow
 
+        ' Preserve the key measures for the history export so charts and pivot
+        ' tables retain consistent column ordering.
         Dim rowValues(1 To 9) As Variant
         rowValues(1) = incidentDate
         rowValues(2) = NzString(data(r, indexes.SourceSystem))
@@ -1597,6 +1731,8 @@ ContinueRow:
     UpdateHistoryNamedRanges historyTable
 End Sub
 
+' Record each workflow execution in the AuditLog table, capturing success or
+' failure details along with summary metrics for quick reference.
 Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date, Optional ByVal errorMessage As String = "")
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -1630,6 +1766,8 @@ Private Sub AppendAuditEntry(ByVal rows As Variant, ByVal runTimestamp As Date, 
     End If
 End Sub
 
+' Create a deterministic fingerprint of the output rows so audit reviewers can
+' compare runs without storing the full dataset in the log table.
 Private Function ComputeRowsDigest(ByVal rows As Variant) As String
     Dim rowCount As Long
     rowCount = ArrayRowCount(rows)
@@ -1649,6 +1787,8 @@ Private Function ComputeRowsDigest(ByVal rows As Variant) As String
     ComputeRowsDigest = Sha256Hex(buffer)
 End Function
 
+' Compute a SHA-256 hash for the supplied value.  Falls back to a lightweight
+' checksum when the .NET crypto provider is not available (e.g. on Mac).
 Private Function Sha256Hex(ByVal value As String) As String
     On Error GoTo fallback
 
@@ -1678,6 +1818,8 @@ Private Function BytesToHex(ByRef bytes() As Byte) As String
     BytesToHex = Join(chars, "")
 End Function
 
+' Basic CRC-like checksum used when SHA256 is unavailable.  It is not
+' cryptographically secure but still differentiates runs for audit purposes.
 Private Function SimpleChecksum(ByVal value As String) As String
     Dim crc As Long
     crc = 0
@@ -1689,6 +1831,7 @@ Private Function SimpleChecksum(ByVal value As String) As String
     SimpleChecksum = Right$("00000000" & Hex$(crc), 8)
 End Function
 
+' Helper that safely returns the first-dimension length of a 2D variant array.
 Private Function ArrayRowCount(ByVal rows As Variant) As Long
     On Error GoTo emptyArray
     If Not IsArray(rows) Then GoTo emptyArray
@@ -1698,6 +1841,8 @@ emptyArray:
     ArrayRowCount = 0
 End Function
 
+' Map a percent-of-records impacted measure to a severity label using the
+' configured thresholds.  Defaults to "Low" when the configuration is missing.
 Private Function DetermineSeverity(ByVal pct As Double, ByVal tableData As Variant) As String
     Dim result As String
     result = "Medium"
@@ -1720,6 +1865,8 @@ Private Function DetermineSeverity(ByVal pct As Double, ByVal tableData As Varia
     DetermineSeverity = result
 End Function
 
+' Map a missing-alert count to a likelihood band using the configuration table.
+' Uses the highest threshold satisfied by the impact value.
 Private Function DetermineLikelihood(ByVal alertImpact As Double, ByVal tableData As Variant) As String
     Dim result As String
     result = "Low"
@@ -1742,6 +1889,8 @@ Private Function DetermineLikelihood(ByVal alertImpact As Double, ByVal tableDat
     DetermineLikelihood = result
 End Function
 
+' Display a one-time warning for a missing configuration table so analysts are
+' aware of default behaviour without flooding them with repeated pop-ups.
 Private Sub NotifyMissingConfig(ByVal tableName As String)
     Dim tracker As Object
     Set tracker = MissingConfigAlertTracker()
@@ -1752,6 +1901,8 @@ Private Sub NotifyMissingConfig(ByVal tableName As String)
     MsgBox "Configuration table '" & tableName & "' has no rows. Default thresholds will be used.", vbExclamation
 End Sub
 
+' Store which missing-configuration warnings have been shown to avoid
+' repeating the same alert during a single workflow execution.
 Private Function MissingConfigAlertTracker() As Object
     Static tracker As Object
     If tracker Is Nothing Then
@@ -1760,6 +1911,8 @@ Private Function MissingConfigAlertTracker() As Object
     Set MissingConfigAlertTracker = tracker
 End Function
 
+' Look up the final qualitative risk rating from the severity/likelihood matrix
+' with a default of "Medium" when either axis is missing from the configuration.
 Private Function ResolveDQFinal(ByVal severity As String, ByVal likelihood As String, ByVal dqMatrix As Object) As String
     If dqMatrix.Exists(severity) Then
         Dim rowDict As Object
@@ -1772,6 +1925,9 @@ Private Function ResolveDQFinal(ByVal severity As String, ByVal likelihood As St
     ResolveDQFinal = "Medium"
 End Function
 
+' Create a dictionary mapping header captions to column positions for the
+' supplied table.  This keeps downstream code resilient to column reordering
+' while avoiding repeated worksheet lookups.
 Private Function BuildHeaderIndex(ByVal table As ListObject) As Object
     Dim dict As Object
     Set dict = NewDictionary()
@@ -1787,6 +1943,9 @@ Private Function BuildHeaderIndex(ByVal table As ListObject) As Object
     Set BuildHeaderIndex = dict
 End Function
 
+' Generic loader for simple configuration tables.  Returns an empty array and
+' surfaces a warning when the table is missing or empty so callers can decide
+' how to proceed.
 Private Function LoadTableData(ByVal sheetName As String, ByVal tableName As String) As Variant
     Dim tbl As ListObject
     Set tbl = GetTableIfExists(sheetName, tableName)
@@ -1806,6 +1965,7 @@ Private Function LoadTableData(ByVal sheetName As String, ByVal tableName As Str
     LoadTableData = tbl.DataBodyRange.Value
 End Function
 
+' Load the severity × likelihood grid that maps to final DQ risk labels.
 Private Function LoadDQMatrix() As Object
     Dim tbl As ListObject
     Set tbl = GetTableIfExists(SHEET_CONFIG, TABLE_DQMATRIX)
@@ -1848,6 +2008,8 @@ Private Function LoadDQMatrix() As Object
     Set LoadDQMatrix = dict
 End Function
 
+' Load the asset-class specific multipliers used to convert missed alerts into
+' quantitative materiality scores.
 Private Function LoadMaterialityRatios() As Object
     Dim dict As Object
     Set dict = NewDictionary()
@@ -1896,6 +2058,9 @@ Private Function LoadMaterialityRatios() As Object
     Set LoadMaterialityRatios = dict
 End Function
 
+' Resolve the materiality multiplier for the supplied asset class and final
+' risk label, falling back through sensible defaults when an exact match is
+' missing.  ratioFound indicates whether any configuration was located.
 Private Function ResolveMaterialityRatio(ByVal assetClass As String, ByVal dqFinal As String, ByVal ratios As Object, ByRef ratioFound As Boolean) As Double
     ratioFound = False
 
@@ -1943,6 +2108,8 @@ Private Function ResolveMaterialityRatio(ByVal assetClass As String, ByVal dqFin
     ResolveMaterialityRatio = 0#
 End Function
 
+' Attempt to fetch a ratio using the provided keys.  Returns True when a value
+' exists, populating ratioValue with the configured multiplier.
 Private Function TryResolveMaterialityRatio(ByVal assetKey As String, ByVal riskKey As String, ByVal ratios As Object, ByRef ratioValue As Double) As Boolean
     If ratios Is Nothing Then Exit Function
     If Not ratios.Exists(assetKey) Then Exit Function
@@ -1997,6 +2164,9 @@ Private Function BuildHistoryKey(ByVal sourceSystem As String, ByVal scenarioNam
     BuildHistoryKey = key
 End Function
 
+' Retrieve the value of a workbook-level named range while surfacing helpful
+' error messages when the name is missing or empty.  Many configuration values
+' rely on this helper to keep validation logic consistent.
 Private Function GetNamedRange(ByVal name As String) As Variant
     Dim wb As Workbook
     Set wb = ThisWorkbook
@@ -2036,6 +2206,8 @@ Private Function GetNamedRange(ByVal name As String) As Variant
     GetNamedRange = targetRange.Value
 End Function
 
+' Initialize the dictionary structure used to accumulate lookback metrics for a
+' given source-system / scenario combination.
 Private Function CreateHistoryBucket() As Object
     Dim bucket As Object
     Set bucket = CreateObject("Scripting.Dictionary")
@@ -2138,6 +2310,8 @@ Private Function NormalizeScenarioName(ByVal value As String) As String
     NormalizeScenarioName = text
 End Function
 
+' Remove all rows from a listobject without deleting the header row.  This
+' prevents residual data from earlier runs affecting current calculations.
 Private Sub ClearTable(ByVal table As ListObject)
     On Error Resume Next
     If table.DataBodyRange Is Nothing Then
