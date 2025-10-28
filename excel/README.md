@@ -13,12 +13,13 @@ behaviour.
 | `Incidents` | `IncidentsRaw` | Raw incident feed imported from the surveillance CSV. Required columns: `Serial Number`, `Date`, `Source System`, `Asset Class`, `Transaction Type`, `Total no. of Records Received`, `Count of Unrequired Records`, `Total Count of Required  Records`, `Count of Failed Records`, `% of Records Impacted`, `Failed KDE Name`, `DMOP Data  Quality Filter That Failed`, `Scenarios Impacted`, `Potential missing alerts per scenario`, plus any additional descriptive fields provided by the analysts. |
 | `Incidents` | `IncidentsExpanded` | Populated by the macro with columns `Serial_Number`, `Source_System`, `Asset_Class`, `Incident_Date`, `Failed_Records`, `Pct_Records_Impacted`, `Scenario_Name`, `Model_Family`, `Missing_Alerts`. Leave headers in place; the macro resizes the table when it runs. |
 | `History` | `HistoryRaw` | Surveillance history keyed by system and scenario. Columns: `Source_System`, `Scenario_Name`, `Period_Start`, `Period_End`, `Records_Observed`, `Alerts_Investigated`, `Materiality_Positive`. |
-| `Output` | `OutputResults` | Final metrics table. Provide headers matching the macro output (`Serial_Number`, `Source_System`, `Asset_Class`, `Incident_Date`, `Scenario_Name`, `Model_Family`, `Severity`, `Failed_Records`, `Pct_Records_Impacted`, `History_AlertRate`, `Missing_Alerts`, `Likelihood_Band`, `DQ_Final_Risk`, `Jeffreys_alpha`, `Jeffreys_beta`, `Materiality_Rate_Mean`, `Materiality_Rate_95UCB`, `Expected_Materiality_Mean`, `Expected_Materiality_95UCB`, `P_AtLeast_One_Material_Event_95UCB`, `Run_Timestamp`, `Run_User`, `Workbook_Version`, `Notes`). |
+| `Output` | `OutputResults` | Final metrics table. Provide headers matching the macro output (`Serial_Number`, `Source_System`, `Asset_Class`, `Incident_Date`, `Scenario_Name`, `Model_Family`, `Severity`, `Failed_Records`, `Pct_Records_Impacted`, `History_AlertRate`, `Missing_Alerts`, `Likelihood_Band`, `DQ_Final_Risk`, `Materiality_Ratio`, `Materiality_Score`, `Reserved_1`, `Reserved_2`, `Reserved_3`, `Reserved_4`, `Reserved_5`, `Run_Timestamp`, `Run_User`, `Workbook_Version`, `Notes`). |
 | `Audit` | `AuditLog` | Tracks every macro run with `Run_Timestamp`, `Run_User`, `Row_Count`, `Digest`. |
 | `Config` | `SeverityThresholds` | Ordered table of severity bands. Columns: `MinPct`, `Severity` (e.g., 0 → Low, 25 → Medium, 50 → High). |
 | `Config` | `LikelihoodThresholds` | Ordered table of likelihood bands with columns `MinImpact`, `Band`. |
 | `Config` | `DQMatrix` | DQ risk matrix. Column 1 = `Severity`, remaining columns named for likelihood bands containing the final risk labels. |
 | `Config` | `ScenarioModelFamilies` | Map each normalised scenario to a model family. Columns: `Scenario_Name`, `Model_Family`. |
+| `Config` | `MaterialityRatios` | Long-term materiality ratios per asset class. Column 1 contains the asset class label (use `Default`/blank for the fallback row) and subsequent columns hold ratios keyed by the DQ risk labels (e.g. `High`, `Medium`, `Low`). |
 | `Config` | `MaterialCategories` | Defines the SWAT output categories to display in the summary and whether each counts as STOR-related. Columns: `Category` (or `Category_Key`), optional `Display_Label`, and `Is_STOR_Related`. |
 | `Config` | `Config_LookbackDays` | Named cell containing the history lookback window in days. |
 | `Config` | `Config_RunUser` | Named cell holding the analyst's name/ID. |
@@ -43,11 +44,10 @@ objects, both of which are present on Windows without additional installation.
    - Uses the `ScenarioModelFamilies` table to enrich each scenario with its
      model family before writing to `IncidentsExpanded`.
    - Aggregates history for the configured lookback window per source-system and
-     scenario and computes the baseline alert rate and Jeffreys prior parameters.
+     scenario and computes the baseline alert rate.
    - Calculates the severity (from `% of Records Impacted`), likelihood (from the
-     potential missed alerts), the DQ materiality risk, and the Poisson
-     probability of observing at least one material event at the 95% upper
-     confidence bound.
+     potential missed alerts), resolves the DQ materiality risk, and applies the
+     asset-class ratio from `MaterialityRatios` to derive the materiality score.
    - Writes the results into `OutputResults` and appends an audit entry with a
      SHA-256 digest of the written rows (falls back to a checksum if SHA-256 is
      unavailable on the machine).
