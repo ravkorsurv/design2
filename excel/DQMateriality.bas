@@ -37,6 +37,7 @@ Private Const TABLE_AUDIT As String = "AuditLog"
 Private Const TABLE_SEVERITY As String = "SeverityThresholds"
 Private Const TABLE_LIKELIHOOD As String = "LikelihoodThresholds"
 Private Const TABLE_DQMATRIX As String = "DQMatrix"
+Private Const TABLE_MATERIALITY_RATIOS As String = "MaterialityRatios"
 Private Const TABLE_SCENARIO_FAMILY As String = "ScenarioModelFamilies"
 
 Private Type IncidentColumnIndexes
@@ -421,19 +422,6 @@ Private Function BuildHistoryRollup() As Object
 
         bucket("IncidentCount") = bucket("IncidentCount") + 1
 
-        Dim percentImpacted As Double
-        percentImpacted = NzDouble(data(r, indexes.PercentImpacted))
-        If missingAlerts > 0# Or percentImpacted > 0# Then
-            bucket("PositiveIncidentCount") = bucket("PositiveIncidentCount") + 1
-        End If
-
-        If incidentDate >= bucket("MostRecentDate") Then
-            bucket("MostRecentDate") = incidentDate
-            bucket("MostRecentFailedRecords") = failedRecords
-            bucket("MostRecentPercentImpacted") = percentImpacted
-            bucket("MostRecentMissingAlerts") = missingAlerts
-        End If
-
         Set dict(key) = bucket
 ContinueRow:
     Next r
@@ -441,7 +429,7 @@ ContinueRow:
     Set BuildHistoryRollup = dict
 End Function
 
-Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, ByVal indexes As IncidentColumnIndexes, ByVal rollup As Object, ByVal severityTable As Variant, ByVal likelihoodTable As Variant, ByVal dqMatrix As Object, ByVal runTimestamp As Date, ByVal runUser As String, ByVal workbookVersion As String) As Variant
+Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, ByVal indexes As IncidentColumnIndexes, ByVal rollup As Object, ByVal severityTable As Variant, ByVal likelihoodTable As Variant, ByVal dqMatrix As Object, ByVal materialityRatios As Object, ByVal runTimestamp As Date, ByVal runUser As String, ByVal workbookVersion As String) As Variant
     Dim sourceSystem As String
     sourceSystem = NzString(data(rowIndex, indexes.SourceSystem))
 
@@ -504,32 +492,23 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     Dim dqFinal As String
     dqFinal = ResolveDQFinal(severity, likelihoodBand, dqMatrix)
 
-    Dim alpha As Double
-    alpha = bucket("PositiveIncidentCount") + 0.5
+    Dim materialityRatio As Double
+    Dim ratioFound As Boolean
+    materialityRatio = ResolveMaterialityRatio(assetClass, dqFinal, materialityRatios, ratioFound)
 
-    Dim beta As Double
-    beta = (bucket("IncidentCount") - bucket("PositiveIncidentCount")) + 0.5
-
-    Dim materialityMean As Double
-    materialityMean = alpha / (alpha + beta)
-
-    Dim materiality95 As Double
-    materiality95 = BetaInverse(alpha, beta, 0.95)
-
-    Dim expectedMean As Double
-    expectedMean = missedAlerts * materialityMean
-
-    Dim expected95 As Double
-    expected95 = missedAlerts * materiality95
-
-    Dim pAtLeastOne As Double
-    pAtLeastOne = 1 - Exp(-expected95)
+    Dim materialityScore As Double
+    materialityScore = missedAlerts * materialityRatio
 
     Dim noteText As String
     If bucket("IncidentCount") = 0 Then
         noteText = "No lookback history available for " & sourceSystem & " / " & scenarioName
     Else
         noteText = ""
+    End If
+
+    If Not ratioFound Then
+        If Len(noteText) > 0 Then noteText = noteText & vbCrLf
+        noteText = noteText & "No materiality ratio configured for asset class '" & IIf(Len(assetClass) = 0, "Unspecified", assetClass) & "' and risk '" & dqFinal & "'"
     End If
 
     Dim result(1 To 24) As Variant
@@ -546,13 +525,13 @@ Private Function BuildOutputRow(ByVal rowIndex As Long, ByVal data As Variant, B
     result(11) = missedAlerts
     result(12) = likelihoodBand
     result(13) = dqFinal
-    result(14) = alpha
-    result(15) = beta
-    result(16) = materialityMean
-    result(17) = materiality95
-    result(18) = expectedMean
-    result(19) = expected95
-    result(20) = pAtLeastOne
+    result(14) = materialityRatio
+    result(15) = materialityScore
+    result(16) = Empty
+    result(17) = Empty
+    result(18) = Empty
+    result(19) = Empty
+    result(20) = Empty
     result(21) = runTimestamp
     result(22) = runUser
     result(23) = workbookVersion
@@ -596,18 +575,21 @@ Private Function ComputeOutputRows(ByVal rollup As Object, ByVal runTimestamp As
     Dim dqMatrix As Object
     Set dqMatrix = LoadDQMatrix()
 
+    Dim materialityRatios As Object
+    Set materialityRatios = LoadMaterialityRatios()
+
     Dim workbookVersion As String
     workbookVersion = CStr(GetNamedRange("Config_WorkbookVersion"))
 
     Dim runUser As String
     runUser = CStr(GetNamedRange("Config_RunUser"))
 
+    Dim rowValues As Variant
+    Dim outCol As Long
     Dim rowIndex As Long
     For rowIndex = 1 To UBound(data, 1)
-        Dim rowValues As Variant
-        rowValues = BuildOutputRow(rowIndex, data, indexes, rollup, severityTable, likelihoodTable, dqMatrix, runTimestamp, runUser, workbookVersion)
+        rowValues = BuildOutputRow(rowIndex, data, indexes, rollup, severityTable, likelihoodTable, dqMatrix, materialityRatios, runTimestamp, runUser, workbookVersion)
 
-        Dim outCol As Long
         For outCol = 1 To 24
             outputRows(rowIndex, outCol) = rowValues(outCol)
         Next outCol
@@ -1520,57 +1502,6 @@ Private Function ResolveDQFinal(ByVal severity As String, ByVal likelihood As St
     ResolveDQFinal = "Medium"
 End Function
 
-Private Function BetaInverse(ByVal alpha As Double, ByVal beta As Double, ByVal quantile As Double) As Double
-    On Error GoTo tryLegacy
-    BetaInverse = Application.WorksheetFunction.Beta_Inv(quantile, alpha, beta)
-    Exit Function
-tryLegacy:
-    On Error GoTo numeric
-    BetaInverse = Application.WorksheetFunction.BetaInv(quantile, alpha, beta)
-    Exit Function
-numeric:
-    BetaInverse = BetaInverseNumeric(alpha, beta, quantile)
-End Function
-
-Private Function BetaInverseNumeric(ByVal alpha As Double, ByVal beta As Double, ByVal quantile As Double) As Double
-    Const MAX_ITER As Long = 80
-    Const EPS As Double = 1E-8
-
-    Dim lo As Double, hi As Double, mid As Double
-    lo = 0
-    hi = 1
-
-    Dim iter As Long
-    For iter = 1 To MAX_ITER
-        mid = (lo + hi) / 2
-        Dim cdf As Double
-        cdf = RegularizedBeta(alpha, beta, mid)
-        If Abs(cdf - quantile) < EPS Then
-            BetaInverseNumeric = mid
-            Exit Function
-        End If
-        If cdf < quantile Then
-            lo = mid
-        Else
-            hi = mid
-        End If
-    Next iter
-
-    BetaInverseNumeric = (lo + hi) / 2
-End Function
-
-Private Function RegularizedBeta(ByVal alpha As Double, ByVal beta As Double, ByVal x As Double) As Double
-    On Error GoTo legacyNew
-    RegularizedBeta = Application.WorksheetFunction.Beta_Dist(x, alpha, beta, True)
-    Exit Function
-legacyNew:
-    On Error GoTo legacyShort
-    RegularizedBeta = Application.WorksheetFunction.BetaDist(x, alpha, beta, True)
-    Exit Function
-legacyShort:
-    RegularizedBeta = Application.WorksheetFunction.BetaDist(x, alpha, beta)
-End Function
-
 Private Function BuildHeaderIndex(ByVal table As ListObject) As Object
     Dim dict As Object
     Set dict = NewDictionary()
@@ -1632,6 +1563,146 @@ Private Function LoadDQMatrix() As Object
     Set LoadDQMatrix = dict
 End Function
 
+Private Function LoadMaterialityRatios() As Object
+    Dim dict As Object
+    Set dict = NewDictionary()
+
+    Dim tbl As ListObject
+    Set tbl = GetTableIfExists(SHEET_CONFIG, TABLE_MATERIALITY_RATIOS)
+    If tbl Is Nothing Then
+        NotifyMissingConfig TABLE_MATERIALITY_RATIOS
+        Set LoadMaterialityRatios = dict
+        Exit Function
+    End If
+
+    If tbl.ListRows.Count = 0 Then
+        NotifyMissingConfig TABLE_MATERIALITY_RATIOS
+        Set LoadMaterialityRatios = dict
+        Exit Function
+    End If
+
+    Dim headers As Variant
+    headers = tbl.HeaderRowRange.Value
+
+    Dim data As Variant
+    data = tbl.DataBodyRange.Value
+
+    Dim r As Long
+    For r = 1 To UBound(data, 1)
+        Dim assetKey As String
+        assetKey = NormalizeScenarioName(NzString(data(r, 1)))
+        If assetKey = "" Then assetKey = "DEFAULT"
+
+        Dim rowDict As Object
+        Set rowDict = NewDictionary()
+
+        Dim c As Long
+        For c = 2 To UBound(headers, 2)
+            Dim headerName As String
+            headerName = NormalizeScenarioName(CStr(headers(1, c)))
+            If headerName <> "" Then
+                rowDict(headerName) = NzDouble(data(r, c))
+            End If
+        Next c
+
+        dict(assetKey) = rowDict
+    Next r
+
+    Set LoadMaterialityRatios = dict
+End Function
+
+Private Function ResolveMaterialityRatio(ByVal assetClass As String, ByVal dqFinal As String, ByVal ratios As Object, ByRef ratioFound As Boolean) As Double
+    ratioFound = False
+
+    If ratios Is Nothing Then
+        ResolveMaterialityRatio = 0#
+        Exit Function
+    End If
+
+    Dim assetKey As String
+    assetKey = NormalizeScenarioName(assetClass)
+    If assetKey = "" Then assetKey = "DEFAULT"
+
+    Dim riskKey As String
+    riskKey = NormalizeScenarioName(dqFinal)
+
+    Dim ratioValue As Double
+    If TryResolveMaterialityRatio(assetKey, riskKey, ratios, ratioValue) Then
+        ratioFound = True
+        ResolveMaterialityRatio = ratioValue
+        Exit Function
+    End If
+
+    If assetKey <> "DEFAULT" Then
+        If TryResolveMaterialityRatio("DEFAULT", riskKey, ratios, ratioValue) Then
+            ratioFound = True
+            ResolveMaterialityRatio = ratioValue
+            Exit Function
+        End If
+    End If
+
+    If TryResolveMaterialityRatio(assetKey, "DEFAULT", ratios, ratioValue) Then
+        ratioFound = True
+        ResolveMaterialityRatio = ratioValue
+        Exit Function
+    End If
+
+    If assetKey <> "DEFAULT" Then
+        If TryResolveMaterialityRatio("DEFAULT", "DEFAULT", ratios, ratioValue) Then
+            ratioFound = True
+            ResolveMaterialityRatio = ratioValue
+            Exit Function
+        End If
+    End If
+
+    ResolveMaterialityRatio = 0#
+End Function
+
+Private Function TryResolveMaterialityRatio(ByVal assetKey As String, ByVal riskKey As String, ByVal ratios As Object, ByRef ratioValue As Double) As Boolean
+    If ratios Is Nothing Then Exit Function
+    If Not ratios.Exists(assetKey) Then Exit Function
+
+    Dim rowDict As Object
+    Set rowDict = ratios(assetKey)
+    If rowDict Is Nothing Then Exit Function
+
+    Dim searchKeys As Collection
+    Set searchKeys = New Collection
+
+    On Error Resume Next
+    If Len(riskKey) > 0 Then
+        searchKeys.Add riskKey, "K" & riskKey
+    Else
+        searchKeys.Add "", "K"
+    End If
+    If Err.Number <> 0 Then Err.Clear
+
+    Dim fallbackOptions As Variant
+    fallbackOptions = VBA.Array("Default", "DEFAULT", "All", "*", "")
+
+    Dim i As Long
+    For i = LBound(fallbackOptions) To UBound(fallbackOptions)
+        Dim candidate As String
+        candidate = NormalizeScenarioName(CStr(fallbackOptions(i)))
+        searchKeys.Add candidate, "K" & candidate
+        If Err.Number <> 0 Then Err.Clear
+    Next i
+    On Error GoTo 0
+
+    Dim item As Variant
+    For Each item In searchKeys
+        Dim candidateKey As String
+        candidateKey = CStr(item)
+        If rowDict.Exists(candidateKey) Then
+            ratioValue = NzDouble(rowDict(candidateKey))
+            TryResolveMaterialityRatio = True
+            Exit Function
+        End If
+    Next item
+
+    TryResolveMaterialityRatio = False
+End Function
+
 Private Function BuildHistoryKey(ByVal sourceSystem As String, ByVal scenarioName As String, Optional ByVal modelFamily As String = "") As String
     Dim key As String
     key = NormalizeScenarioName(sourceSystem) & "|" & NormalizeScenarioName(scenarioName)
@@ -1652,11 +1723,6 @@ Private Function CreateHistoryBucket() As Object
     bucket("IncidentCount") = 0#
     bucket("TotalFailedRecords") = 0#
     bucket("TotalMissingAlerts") = 0#
-    bucket("PositiveIncidentCount") = 0#
-    bucket("MostRecentDate") = 0#
-    bucket("MostRecentFailedRecords") = 0#
-    bucket("MostRecentPercentImpacted") = 0#
-    bucket("MostRecentMissingAlerts") = 0#
     Set CreateHistoryBucket = bucket
 End Function
 
